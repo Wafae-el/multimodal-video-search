@@ -1,0 +1,26 @@
+import asyncio
+
+from temporalio.client import Client
+from temporalio.worker import Worker
+
+from packages.workflow.activities import validate_asset
+from packages.workflow.workflows import ProcessAssetWorkflow
+
+
+async def main():
+    client = await Client.connect("localhost:7233")
+
+    worker = Worker(
+        client,
+        task_queue="video-processing",
+        workflows=[ProcessAssetWorkflow],
+        activities=[validate_asset],
+    )
+
+    print("Temporal Worker started...")
+
+    await worker.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

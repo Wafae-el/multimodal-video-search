@@ -1,6 +1,5 @@
 from sqlalchemy.orm import Session
-
-from services.metadata.models import Video
+from packages.metadata.models import Video
 
 
 def create_video(
@@ -13,6 +12,8 @@ def create_video(
     height: int,
     size: int,
 ):
+    print(">>> Creating video in PostgreSQL")
+
     video = Video(
         filename=filename,
         content_type=content_type,
@@ -24,7 +25,12 @@ def create_video(
     )
 
     db.add(video)
+    print(">>> Added to session")
+
     db.commit()
+    print(">>> Commit OK")
+
     db.refresh(video)
+    print(">>> Video ID:", video.id)
 
     return video

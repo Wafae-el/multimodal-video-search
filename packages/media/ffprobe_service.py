@@ -1,13 +1,10 @@
 import json
 import subprocess
 from pathlib import Path
-
-
 def analyze_video(video_path: Path) -> dict:
     """
     Analyze a video using ffprobe and return its metadata.
     """
-
     result = subprocess.run(
         [
             "ffprobe",
