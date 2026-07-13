@@ -1,3 +1,4 @@
+from packages.workflow.state_machine import ProcessingState
 from sqlalchemy.orm import Session
 
 from packages.metadata.models import Video
@@ -22,7 +23,7 @@ def create_video(
         width=width,
         height=height,
         size=size,
-        status="UPLOADED",
+        status=ProcessingState.UPLOADED.value,
         progress=0,
         attempts=1,
     )

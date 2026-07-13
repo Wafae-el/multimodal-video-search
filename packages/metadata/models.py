@@ -22,3 +22,5 @@ class Video(Base):
     progress = Column(Integer, default=0)
     attempts = Column(Integer, default=0)
     last_error = Column(String, nullable=True)
+
+    

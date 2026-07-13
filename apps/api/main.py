@@ -38,15 +38,36 @@ async def upload_video(
         shutil.copyfileobj(file.file, buffer)
 
     # Analyse FFprobe
-    metadata = analyze_video(file_path)
+    try:
+        metadata = analyze_video(file_path)
+    except Exception as e:
+        return {
+        "status": "FAILED",
+        "error": str(e),
+        }
 
     video_stream = next(
         stream
         for stream in metadata["streams"]
         if stream["codec_type"] == "video"
     )
+    audio_stream = next(
+        (
+            stream
+            for stream in metadata["streams"]
+            if stream["codec_type"] == "audio"
+        ),
+        None,
+    )
+    
+    if audio_stream is None:
+        return {
+            "status": "NO_AUDIO",
+            "error": "No audio stream found",
+        }
 
     # Sauvegarde des métadonnées
+
     video = create_video(
         db=db,
         filename=file.filename,

@@ -1,3 +1,4 @@
+from packages.workflow.state_machine import ProcessingState
 from temporalio import activity
 from packages.metadata.database import get_session
 from packages.metadata.crud import update_video_status
@@ -10,7 +11,7 @@ async def validate_asset(asset: dict) -> dict:
     update_video_status(
         db=db,
         video_id=asset["video_id"],
-        status="VALIDATING",
+        status=ProcessingState.VALIDATING.value,
         progress=20,
     )
 
@@ -29,7 +30,7 @@ async def probe_video(asset: dict) -> dict:
     update_video_status(
         db=db,
         video_id=asset["video_id"],
-        status="PROBING",
+        status=ProcessingState.PROBING.value,
         progress=40,
     )
 
@@ -48,7 +49,7 @@ async def normalize_video(asset: dict) -> dict:
     update_video_status(
         db=db,
         video_id=asset["video_id"],
-        status="NORMALIZING",
+        status=ProcessingState.NORMALIZING.value,
         progress=60,
     )
 
@@ -67,7 +68,7 @@ async def extract_audio(asset: dict) -> dict:
     update_video_status(
         db=db,
         video_id=asset["video_id"],
-        status="EXTRACTING_AUDIO",
+        status=ProcessingState.EXTRACTING_AUDIO.value,
         progress=80,
     )
 
@@ -86,7 +87,7 @@ async def generate_thumbnail(asset: dict) -> dict:
     update_video_status(
         db=db,
         video_id=asset["video_id"],
-        status="DONE",
+        status=ProcessingState.DONE.value,
         progress=100,
     )
 
