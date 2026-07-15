@@ -6,6 +6,8 @@ from packages.workflow.activities import (
     validate_asset,
     probe_video,
     normalize_video,
+    detect_scenes_activity,
+    extract_frames_activity,
     extract_audio,
     generate_thumbnail,
 )
@@ -31,6 +33,18 @@ class ProcessAssetWorkflow:
 
         asset = await workflow.execute_activity(
             normalize_video,
+            asset,
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        asset = await workflow.execute_activity(
+            detect_scenes_activity,
+            asset,
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        asset = await workflow.execute_activity(
+            extract_frames_activity,
             asset,
             start_to_close_timeout=timedelta(seconds=30),
         )

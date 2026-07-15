@@ -7,6 +7,8 @@ from packages.workflow.activities import (
     validate_asset,
     probe_video,
     normalize_video,
+    detect_scenes_activity,
+    extract_frames_activity,
     extract_audio,
     generate_thumbnail,
 )
@@ -23,11 +25,13 @@ async def main():
         task_queue="video-processing",
         workflows=[ProcessAssetWorkflow],
         activities=[
-            validate_asset,
-            probe_video,
-            normalize_video,
-            extract_audio,
-            generate_thumbnail,
+             validate_asset,
+             probe_video,
+             normalize_video,
+             detect_scenes_activity,
+             extract_frames_activity,
+             extract_audio,
+             generate_thumbnail,
         ],
     )
 

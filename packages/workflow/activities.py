@@ -1,7 +1,11 @@
-from packages.workflow.state_machine import ProcessingState
+from pathlib import Path
+
 from temporalio import activity
+
+from packages.workflow.state_machine import ProcessingState
 from packages.metadata.database import get_session
 from packages.metadata.crud import update_video_status
+
 
 @activity.defn
 async def validate_asset(asset: dict) -> dict:
@@ -61,7 +65,53 @@ async def normalize_video(asset: dict) -> dict:
 
 
 @activity.defn
+async def detect_scenes_activity(asset: dict) -> dict:
+
+    from packages.segmentation.scene_detector import detect_scenes
+
+    print(f"[Scene Detection] {asset['filename']}")
+
+    video_path = Path("temp") / asset["filename"]
+
+    scenes = detect_scenes(video_path)
+
+    asset["scenes"] = scenes
+
+    print(f"Detected {len(scenes)} scenes")
+
+    return asset
+
+
+@activity.defn
+async def extract_frames_activity(asset: dict) -> dict:
+
+    from packages.segmentation.frame_extractor import (
+        extract_representative_frames,
+    )
+
+    print(f"[Representative Frames] {asset['filename']}")
+
+    video_path = Path("temp") / asset["filename"]
+
+    frames = extract_representative_frames(
+        video_path,
+        asset["scenes"],
+        Path("frames"),
+    )
+
+    asset["frames"] = frames
+
+    print(f"Extracted {len(frames)} frames")
+
+    return asset
+
+
+@activity.defn
 async def extract_audio(asset: dict) -> dict:
+
+    from packages.segmentation.audio_extractor import (
+        extract_audio as extract_audio_file,
+    )
 
     db = get_session()
 
@@ -72,7 +122,16 @@ async def extract_audio(asset: dict) -> dict:
         progress=80,
     )
 
-    print(f"[Extract Audio] {asset['filename']}")
+    video_path = Path("temp") / asset["filename"]
+
+    audio_path = extract_audio_file(
+        video_path,
+        Path("audio"),
+    )
+
+    asset["audio"] = str(audio_path)
+
+    print(f"[Extract Audio] {audio_path}")
 
     db.close()
 

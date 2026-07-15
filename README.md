@@ -2,15 +2,21 @@
 
 ## Overview
 
-Multimodal Video Search is a backend service for ingesting and processing videos.
+Multimodal Video Search is a backend platform for ingesting and processing videos in preparation for multimodal retrieval.
 
-The Week 1 implementation provides:
+The Week 1 implementation provides the ingestion foundation with a durable processing pipeline based on FastAPI, PostgreSQL, MinIO, and Temporal.
+
+Implemented features:
 
 - FastAPI upload API
-- ffprobe video validation
-- PostgreSQL metadata storage
+- FFprobe video validation
+- PostgreSQL metadata persistence
 - MinIO object storage
-- Temporal workflow foundation
+- Temporal durable workflow
+- Video processing state tracking
+- Scene detection
+- Representative frame extraction
+- Audio extraction
 - Docker Compose infrastructure
 
 ---
@@ -31,13 +37,15 @@ docs/
 
 ## Requirements
 
-- Docker Desktop
 - Python 3.12
-- FFmpeg (ffprobe)
+- Docker Desktop
+- FFmpeg (ffmpeg & ffprobe)
 
 ---
 
-## Install
+## Installation
+
+Install the project dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -45,7 +53,9 @@ pip install -r requirements.txt
 
 ---
 
-## Start Docker
+## Start Infrastructure
+
+Start PostgreSQL, MinIO and Qdrant:
 
 ```bash
 cd infrastructure
@@ -55,7 +65,7 @@ docker compose up -d
 
 ---
 
-## Initialize database
+## Initialize the Database
 
 ```bash
 python -m scripts.init_db
@@ -63,15 +73,29 @@ python -m scripts.init_db
 
 ---
 
-## Start API
+## Start the API
 
 ```bash
 uvicorn apps.api.main:app --reload
 ```
 
+The API will be available at:
+
+```
+http://127.0.0.1:8000
+```
+
+Swagger UI:
+
+```
+http://127.0.0.1:8000/docs
+```
+
 ---
 
-## Start Worker
+## Start the Temporal Worker
+
+Open another terminal and run:
 
 ```bash
 python -m workers.ingestion.worker
@@ -79,19 +103,62 @@ python -m workers.ingestion.worker
 
 ---
 
-## API
+## Upload a Video
 
-Swagger
-
-```
-http://127.0.0.1:8000/docs
-```
-
-POST
+Use Swagger or send a POST request to:
 
 ```
-/upload
+POST /upload
 ```
+
+After uploading a video, the processing workflow performs:
+
+1. Video validation
+2. FFprobe metadata extraction
+3. Metadata persistence
+4. Scene detection
+5. Representative frame extraction
+6. Audio extraction
+7. Workflow completion
+
+---
+
+## Running Tests
+
+Run all available tests:
+
+```bash
+pytest
+```
+
+Run only the Coding Quest tests:
+
+```bash
+pytest tests/katas/crash_proof_castle
+```
+
+---
+
+## Manual Verification
+
+To manually verify the pipeline:
+
+1. Start Docker services.
+2. Initialize the database.
+3. Start the FastAPI application.
+4. Start the Temporal worker.
+5. Open Swagger.
+6. Upload a video.
+
+Expected result:
+
+- Video uploaded successfully.
+- Metadata stored in PostgreSQL.
+- Workflow starts automatically.
+- Scenes are detected.
+- Representative frames are generated.
+- Audio is extracted.
+- Workflow completes successfully.
 
 ---
 
@@ -99,6 +166,30 @@ POST
 
 - FastAPI
 - PostgreSQL
+- SQLAlchemy
 - MinIO
 - Temporal
 - Qdrant
+- OpenCV
+- FFmpeg / FFprobe
+- Pydantic
+
+---
+
+## Week 1 Deliverables
+
+Completed:
+
+- Repository foundation
+- Docker Compose environment
+- FastAPI upload endpoint
+- FFprobe validation
+- PostgreSQL metadata persistence
+- MinIO object storage
+- Temporal durable workflow
+- Processing state tracking
+- Scene detection
+- Representative frame extraction
+- Audio extraction
+- Unit tests
+- Coding Quest 1
