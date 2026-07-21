@@ -1,61 +1,204 @@
-from packages.workflow.state_machine import ProcessingState
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
-from packages.metadata.models import Video
+from packages.metadata.models import (
+    Video,
+    MediaFile,
+    ProcessingStep,
+)
+from packages.workflow.state_machine import ProcessingState
 
 
-def create_video(
+def create_asset(
     db: Session,
-    filename: str,
-    content_type: str,
-    duration: float,
-    codec: str,
-    width: int,
-    height: int,
-    size: int,
+    **kwargs,
 ):
-
-    video = Video(
-        filename=filename,
-        content_type=content_type,
-        duration=duration,
-        codec=codec,
-        width=width,
-        height=height,
-        size=size,
-        status=ProcessingState.UPLOADED.value,
-        progress=0,
-        attempts=1,
-    )
-
-    db.add(video)
-    db.commit()
-    db.refresh(video)
-
-    return video
+    try:
+        asset = Video(**kwargs)
+        db.add(asset)
+        db.commit()
+        db.refresh(asset)
+        return asset
+    except SQLAlchemyError:
+        db.rollback()
+        raise
 
 
-def update_video_status(
+def register_original_media(
     db: Session,
     video_id: int,
-    status: str,
-    progress: int = None,
-    last_error: str = None,
+    bucket: str,
+    object_key: str,
+    checksum: str,
 ):
-    video = db.query(Video).filter(Video.id == video_id).first()
+    try:
+        media = MediaFile(
+            video_id=video_id,
+            file_type="original",
+            bucket=bucket,
+            object_key=object_key,
+            checksum=checksum,
+        )
 
-    if not video:
-        return None
+        db.add(media)
+        db.commit()
+        db.refresh(media)
 
-    video.status = status
+        return media
 
-    if progress is not None:
-        video.progress = progress
+    except SQLAlchemyError:
+        db.rollback()
+        raise
 
-    if last_error is not None:
-        video.last_error = last_error
 
-    db.commit()
-    db.refresh(video)
+def get_asset_status(
+    db: Session,
+    asset_id: str,
+):
+    return (
+        db.query(Video)
+        .filter(Video.asset_id == asset_id)
+        .first()
+    )
 
-    return video
+
+def increment_attempts(
+    db: Session,
+    asset_id: str,
+):
+    try:
+        asset = (
+            db.query(Video)
+            .filter(Video.asset_id == asset_id)
+            .first()
+        )
+
+        if asset is None:
+            return None
+
+        asset.attempts += 1
+
+        db.commit()
+        db.refresh(asset)
+
+        return asset
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
+def start_processing_step(
+    db: Session,
+    video_id: int,
+    step_name: str,
+    step_version: str,
+    operation_key: str,
+):
+    try:
+        existing = (
+            db.query(ProcessingStep)
+            .filter(
+                ProcessingStep.operation_key == operation_key
+            )
+            .first()
+        )
+
+        if existing:
+            return existing
+
+        step = ProcessingStep(
+            video_id=video_id,
+            step_name=step_name,
+            step_version=step_version,
+            operation_key=operation_key,
+            state="RUNNING",
+            attempts=1,
+        )
+
+        db.add(step)
+        db.commit()
+        db.refresh(step)
+
+        return step
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
+def complete_processing_step(
+    db: Session,
+    operation_key: str,
+    output_key: str,
+    output_checksum: str,
+):
+    try:
+        step = (
+            db.query(ProcessingStep)
+            .filter(
+                ProcessingStep.operation_key == operation_key
+            )
+            .first()
+        )
+
+        if step is None:
+            return None
+
+        step.state = "COMPLETED"
+        step.output_key = output_key
+        step.output_checksum = output_checksum
+
+        db.commit()
+        db.refresh(step)
+
+        return step
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
+def fail_processing_step(
+    db: Session,
+    operation_key: str,
+    error: str,
+):
+    try:
+        step = (
+            db.query(ProcessingStep)
+            .filter(
+                ProcessingStep.operation_key == operation_key
+            )
+            .first()
+        )
+
+        if step is None:
+            return None
+
+        step.state = "FAILED"
+        step.last_error = error
+        step.attempts += 1
+
+        db.commit()
+        db.refresh(step)
+
+        return step
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
+def reuse_completed_operation(
+    db: Session,
+    operation_key: str,
+):
+    return (
+        db.query(ProcessingStep)
+        .filter(
+            ProcessingStep.operation_key == operation_key,
+            ProcessingStep.state == "COMPLETED",
+        )
+        .first()
+    )

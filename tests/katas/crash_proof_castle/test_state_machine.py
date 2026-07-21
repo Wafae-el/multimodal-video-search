@@ -1,59 +1,71 @@
-from state_machine import ProcessingState, ProcessingEvent
+import pytest
 
+from packages.workflow.state_machine import (
+    ProcessingState,
+    ProcessingEvent,
+    next_state,
+)
 
-def test_processing_states():
-
-    assert ProcessingState.WAITING_UPLOAD.value == "WAITING_UPLOAD"
-    assert ProcessingState.PROCESSING.value == "PROCESSING"
-    assert ProcessingState.COMPLETED.value == "COMPLETED"
-    assert ProcessingState.FAILED.value == "FAILED"
-
-
-def test_processing_events():
-
-    assert ProcessingEvent.UPLOAD_COMPLETE.value == "upload_complete"
-    assert ProcessingEvent.WORKER_CRASH.value == "worker_crash"
-    assert ProcessingEvent.RETRY.value == "retry"
-    assert ProcessingEvent.DUPLICATE_DELIVERY.value == "duplicate_delivery"
-    assert ProcessingEvent.OUTPUT_EXISTS.value == "output_exists"
-
-from state_machine import next_state
 
 def test_upload_complete():
-
     assert next_state(
-        ProcessingState.WAITING_UPLOAD,
+        ProcessingState.UPLOADED,
         ProcessingEvent.UPLOAD_COMPLETE,
-    ) == ProcessingState.PROCESSING
+    ) == ProcessingState.VALIDATING
 
 
-def test_worker_crash():
-
+def test_validation_ok():
     assert next_state(
-        ProcessingState.PROCESSING,
-        ProcessingEvent.WORKER_CRASH,
+        ProcessingState.VALIDATING,
+        ProcessingEvent.VALIDATION_OK,
+    ) == ProcessingState.PROBING
+
+
+def test_probe_ok():
+    assert next_state(
+        ProcessingState.PROBING,
+        ProcessingEvent.PROBE_OK,
+    ) == ProcessingState.NORMALIZING
+
+
+def test_normalize_ok():
+    assert next_state(
+        ProcessingState.NORMALIZING,
+        ProcessingEvent.NORMALIZE_OK,
+    ) == ProcessingState.EXTRACTING_AUDIO
+
+
+def test_audio_ok():
+    assert next_state(
+        ProcessingState.EXTRACTING_AUDIO,
+        ProcessingEvent.AUDIO_OK,
+    ) == ProcessingState.GENERATING_THUMBNAIL
+
+
+def test_thumbnail_ok():
+    assert next_state(
+        ProcessingState.GENERATING_THUMBNAIL,
+        ProcessingEvent.THUMBNAIL_OK,
+    ) == ProcessingState.DONE
+
+
+def test_no_audio():
+    assert next_state(
+        ProcessingState.VALIDATING,
+        ProcessingEvent.NO_AUDIO,
+    ) == ProcessingState.NO_AUDIO
+
+
+def test_error():
+    assert next_state(
+        ProcessingState.PROBING,
+        ProcessingEvent.ERROR,
     ) == ProcessingState.FAILED
 
 
-def test_retry():
-
-    assert next_state(
-        ProcessingState.FAILED,
-        ProcessingEvent.RETRY,
-    ) == ProcessingState.PROCESSING
-
-
-def test_output_exists():
-
-    assert next_state(
-        ProcessingState.PROCESSING,
-        ProcessingEvent.OUTPUT_EXISTS,
-    ) == ProcessingState.COMPLETED
-
-
-def test_duplicate_delivery():
-
-    assert next_state(
-        ProcessingState.COMPLETED,
-        ProcessingEvent.DUPLICATE_DELIVERY,
-    ) == ProcessingState.COMPLETED
+def test_invalid_transition():
+    with pytest.raises(ValueError):
+        next_state(
+            ProcessingState.UPLOADED,
+            ProcessingEvent.THUMBNAIL_OK,
+        )

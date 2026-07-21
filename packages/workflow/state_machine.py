@@ -14,18 +14,27 @@ class ProcessingState(str, Enum):
 
 
 class ProcessingEvent(str, Enum):
+    # Événements de progression normale
     UPLOAD_COMPLETE = "UPLOAD_COMPLETE"
     VALIDATION_OK = "VALIDATION_OK"
     PROBE_OK = "PROBE_OK"
     NORMALIZE_OK = "NORMALIZE_OK"
     AUDIO_OK = "AUDIO_OK"
     THUMBNAIL_OK = "THUMBNAIL_OK"
+
+    # Événements spéciaux / reprises
+    RETRY = "RETRY"
+    DUPLICATE_DELIVERY = "DUPLICATE_DELIVERY"
+    OUTPUT_EXISTS = "OUTPUT_EXISTS"
+    NO_AUDIO = "NO_AUDIO"
+
+    # Événement d'erreur générique
     ERROR = "ERROR"
-    
+
+
 def next_state(state: ProcessingState, event: ProcessingEvent) -> ProcessingState:
-
     transitions = {
-
+        # Parcours nominal
         (ProcessingState.UPLOADED, ProcessingEvent.UPLOAD_COMPLETE):
             ProcessingState.VALIDATING,
 
@@ -43,6 +52,26 @@ def next_state(state: ProcessingState, event: ProcessingEvent) -> ProcessingStat
 
         (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.THUMBNAIL_OK):
             ProcessingState.DONE,
+
+        # Gestion des erreurs spécifiques
+        (ProcessingState.VALIDATING, ProcessingEvent.NO_AUDIO):
+            ProcessingState.NO_AUDIO,
+
+        (ProcessingState.PROBING, ProcessingEvent.ERROR):
+            ProcessingState.FAILED,
+
+        (ProcessingState.NORMALIZING, ProcessingEvent.ERROR):
+            ProcessingState.FAILED,
+
+        (ProcessingState.EXTRACTING_AUDIO, ProcessingEvent.ERROR):
+            ProcessingState.FAILED,
+
+        (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.ERROR):
+            ProcessingState.FAILED,
     }
 
-    return transitions.get((state, event), ProcessingState.FAILED)
+    # Lève une exception explicite si la transition est invalide
+    if (state, event) not in transitions:
+        raise ValueError(f"Invalid transition: {state} + {event}")
+
+    return transitions[(state, event)]

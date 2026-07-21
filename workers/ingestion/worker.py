@@ -3,39 +3,46 @@ import asyncio
 from temporalio.client import Client
 from temporalio.worker import Worker
 
+from packages.config.settings import settings
+
 from packages.workflow.activities import (
-    validate_asset,
     probe_video,
     normalize_video,
-    detect_scenes_activity,
-    extract_frames_activity,
     extract_audio,
     generate_thumbnail,
 )
 
-from packages.workflow.workflows import ProcessAssetWorkflow
+from packages.workflow.workflows import (
+    ProcessAssetWorkflow,
+)
 
 
 async def main():
 
-    client = await Client.connect("localhost:7233")
+    client = await Client.connect(
+        settings.TEMPORAL_ADDRESS,
+    )
 
     worker = Worker(
         client,
-        task_queue="video-processing",
-        workflows=[ProcessAssetWorkflow],
+        task_queue=settings.TEMPORAL_TASK_QUEUE,
+
+        workflows=[
+            ProcessAssetWorkflow,
+        ],
+
         activities=[
-             validate_asset,
-             probe_video,
-             normalize_video,
-             detect_scenes_activity,
-             extract_frames_activity,
-             extract_audio,
-             generate_thumbnail,
+            probe_video,
+            normalize_video,
+            extract_audio,
+            generate_thumbnail,
         ],
     )
 
-    print("Temporal Worker started...")
+    print(
+        f"Temporal Worker started on "
+        f"{settings.TEMPORAL_TASK_QUEUE}"
+    )
 
     await worker.run()
 

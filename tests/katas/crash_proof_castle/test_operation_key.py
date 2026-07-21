@@ -1,16 +1,15 @@
-from operation_key import operation_key
+from packages.workflow.activities import build_operation_key
 
 
 def test_operation_key_is_deterministic():
-
-    key1 = operation_key(
+    key1 = build_operation_key(
         "abc123",
         "ffmpeg",
         "v1",
         "whisper-large-v3",
     )
 
-    key2 = operation_key(
+    key2 = build_operation_key(
         "abc123",
         "ffmpeg",
         "v1",
@@ -20,21 +19,75 @@ def test_operation_key_is_deterministic():
     assert key1 == key2
 
 
-def test_operation_key_changes_when_input_changes():
-
-    key1 = operation_key(
+def test_operation_key_changes_when_asset_changes():
+    assert build_operation_key(
         "abc123",
         "ffmpeg",
         "v1",
         "whisper-large-v3",
-    )
-
-    key2 = operation_key(
+    ) != build_operation_key(
         "xyz789",
         "ffmpeg",
         "v1",
         "whisper-large-v3",
     )
 
+
+def test_operation_key_changes_when_step_changes():
+    assert build_operation_key(
+        "abc123",
+        "ffmpeg",
+        "v1",
+        "whisper-large-v3",
+    ) != build_operation_key(
+        "abc123",
+        "thumbnail",
+        "v1",
+        "whisper-large-v3",
+    )
+
+
+def test_operation_key_changes_when_step_version_changes():
+    assert build_operation_key(
+        "abc123",
+        "ffmpeg",
+        "v1",
+        "whisper-large-v3",
+    ) != build_operation_key(
+        "abc123",
+        "ffmpeg",
+        "v2",
+        "whisper-large-v3",
+    )
+
+
+def test_operation_key_changes_when_model_version_changes():
+    assert build_operation_key(
+        "abc123",
+        "ffmpeg",
+        "v1",
+        "whisper-large-v3",
+    ) != build_operation_key(
+        "abc123",
+        "ffmpeg",
+        "v1",
+        "whisper-large-v4",
+    )
+
+
+def test_operation_key_avoids_ambiguous_concatenation():
+    key1 = build_operation_key(
+        "ab",
+        "c",
+        "d",
+        "e",
+    )
+
+    key2 = build_operation_key(
+        "a",
+        "bc",
+        "d",
+        "e",
+    )
+
     assert key1 != key2
-    

@@ -5,3 +5,11 @@ __pycache__/
 .vscode/
 .venv/
 temp/
+# Generated files
+audio/
+frames/
+temp/
+
+# Python cache
+__pycache__/
+*.pyc
