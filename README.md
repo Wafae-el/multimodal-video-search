@@ -14,9 +14,9 @@ Implemented features:
 - MinIO object storage
 - Temporal durable workflow
 - Video processing state tracking
-- Scene detection
-- Representative frame extraction
+- Video normalization
 - Audio extraction
+- Thumbnail extraction
 - Docker Compose infrastructure
 
 ---
@@ -55,7 +55,7 @@ pip install -r requirements.txt
 
 ## Start Infrastructure
 
-Start PostgreSQL, MinIO and Qdrant:
+Start PostgreSQL, MinIO, Temporal and Qdrant:
 
 ```bash
 cd infrastructure
@@ -67,8 +67,17 @@ docker compose up -d
 
 ## Initialize the Database
 
+Return to the repository root before running the initialization script:
+
 ```bash
+cd ..
 python -m scripts.init_db
+```
+
+If you run the API or worker directly from your host machine instead of Docker, set `DATABASE_URL` in your local `.env` to use `localhost` and the installed psycopg v3 driver:
+
+```env
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/video_search
 ```
 
 ---
@@ -108,7 +117,7 @@ python -m workers.ingestion.worker
 Use Swagger or send a POST request to:
 
 ```
-POST /upload
+POST /v1/upload
 ```
 
 After uploading a video, the processing workflow performs:
@@ -116,9 +125,9 @@ After uploading a video, the processing workflow performs:
 1. Video validation
 2. FFprobe metadata extraction
 3. Metadata persistence
-4. Scene detection
-5. Representative frame extraction
-6. Audio extraction
+4. Video normalization
+5. Audio extraction
+6. Thumbnail extraction
 7. Workflow completion
 
 ---
@@ -155,9 +164,9 @@ Expected result:
 - Video uploaded successfully.
 - Metadata stored in PostgreSQL.
 - Workflow starts automatically.
-- Scenes are detected.
-- Representative frames are generated.
+- The video is normalized.
 - Audio is extracted.
+- A thumbnail is generated.
 - Workflow completes successfully.
 
 ---
@@ -188,8 +197,8 @@ Completed:
 - MinIO object storage
 - Temporal durable workflow
 - Processing state tracking
-- Scene detection
-- Representative frame extraction
+- Video normalization
 - Audio extraction
+- Thumbnail extraction
 - Unit tests
 - Coding Quest 1

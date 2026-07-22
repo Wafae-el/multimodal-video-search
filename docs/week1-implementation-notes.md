@@ -10,9 +10,9 @@ Initially, the workflow ended after validation, metadata storage and workflow ex
 
 The following modules were implemented earlier than originally planned:
 
-- Scene detection
-- Representative frame extraction
+- Video normalization
 - Audio extraction
+- Thumbnail extraction
 
 These modules are located under:
 
@@ -33,7 +33,7 @@ This allowed me to verify:
 - Temporal workflow execution
 - Activity orchestration
 - Shared processing state
-- Generated frames
+- Generated thumbnail
 - Extracted audio
 - End-to-end workflow completion
 
