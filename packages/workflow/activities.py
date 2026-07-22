@@ -86,36 +86,41 @@ def download_original_video(asset_info: AssetInfo) -> Path:
 
 
 def begin_step(asset_info: AssetInfo, step_name: str, tool_version: str = "1.0"):
-    db = get_session()
     operation_key = build_operation_key(
         asset_info.source_checksum,
         step_name,
         asset_info.pipeline_version,
         tool_version,
     )
-    existing = reuse_completed_operation(db, operation_key)
-    if existing:
-        db.close()
-        return (None, operation_key, existing)
+    with get_session() as db:
+        existing = reuse_completed_operation(db, operation_key)
+        if existing:
+            return (
+                operation_key,
+                {
+                    "output_key": existing.output_key,
+                    "output_checksum": existing.output_checksum,
+                },
+            )
 
-    start_processing_step(
-        db=db,
-        video_id=asset_info.id,
-        step_name=step_name,
-        step_version=asset_info.pipeline_version,
-        operation_key=operation_key,
-    )
-    return (db, operation_key, None)
+        start_processing_step(
+            db=db,
+            video_id=asset_info.id,
+            step_name=step_name,
+            step_version=asset_info.pipeline_version,
+            operation_key=operation_key,
+        )
+    return (operation_key, None)
 
 
-def finish_step(db, operation_key, checksum, object_key):
-    complete_processing_step(db, operation_key, object_key, checksum)
-    db.close()
+def finish_step(operation_key, checksum, object_key):
+    with get_session() as db:
+        complete_processing_step(db, operation_key, object_key, checksum)
 
 
-def fail_step(db, operation_key, error):
-    fail_processing_step(db, operation_key, str(error))
-    db.close()
+def fail_step(operation_key, error):
+    with get_session() as db:
+        fail_processing_step(db, operation_key, str(error))
 
 
 def update_asset_state(asset_id: str, event: ProcessingEvent, progress: int = None, error: str = None):
@@ -123,8 +128,7 @@ def update_asset_state(asset_id: str, event: ProcessingEvent, progress: int = No
     Applique la transition d'état définie dans la machine à états,
     puis met à jour l'asset en base.
     """
-    db = get_session()
-    try:
+    with get_session() as db:
         asset = get_asset_status(db, asset_id)
         if asset is None:
             raise RuntimeError(f"Asset {asset_id} not found")
@@ -144,10 +148,7 @@ def update_asset_state(asset_id: str, event: ProcessingEvent, progress: int = No
         else:
             asset.last_error = None
 
-        db.commit()
         activity.logger.info(f"Asset {asset_id} transitioned from {current_state.value} to {new_state.value} via {event.value}")
-    finally:
-        db.close()
 
 
 # ---------- Activités ----------
@@ -159,8 +160,7 @@ async def probe_video(asset_input: dict) -> dict:
     """
     activity.logger.info(f"Starting probe_video for asset {asset_input['asset_id']}")
 
-    db = get_session()
-    try:
+    with get_session() as db:
         asset = get_asset_status(db, asset_input["asset_id"])
         if asset is None:
             raise RuntimeError("ASSET_NOT_FOUND")
@@ -172,15 +172,13 @@ async def probe_video(asset_input: dict) -> dict:
             minio_bucket=asset.minio_bucket,
             minio_object_key=asset.minio_object_key,
         )
-    finally:
-        db.close()
 
     # --- Correction 2 : deux transitions successives pour respecter la machine ---
     # UPLOADED --UPLOAD_COMPLETE--> VALIDATING --VALIDATION_OK--> PROBING
     update_asset_state(asset_info.asset_id, ProcessingEvent.UPLOAD_COMPLETE)
     update_asset_state(asset_info.asset_id, ProcessingEvent.VALIDATION_OK)
 
-    db, operation_key, existing = begin_step(
+    operation_key, existing = begin_step(
         asset_info,
         "probe",
         tool_version="ffprobe-1",
@@ -192,8 +190,8 @@ async def probe_video(asset_input: dict) -> dict:
         return {
             "asset_id": asset_info.asset_id,
             "pipeline_version": asset_info.pipeline_version,
-            "probe_checksum": existing.output_checksum,
-            "probe_key": existing.output_key,
+            "probe_checksum": existing["output_checksum"],
+            "probe_key": existing["output_key"],
         }
 
     try:
@@ -212,7 +210,7 @@ async def probe_video(asset_input: dict) -> dict:
         )
 
         checksum = sha256_file(probe_file)
-        finish_step(db, operation_key, checksum, None)
+        finish_step(operation_key, checksum, None)
 
         update_asset_state(asset_info.asset_id, ProcessingEvent.PROBE_OK)
 
@@ -226,15 +224,13 @@ async def probe_video(asset_input: dict) -> dict:
 
     except MediaValidationError as exc:
         activity.logger.error(f"Media validation error for asset {asset_info.asset_id}: {exc.code}")
-        if db:
-            fail_step(db, operation_key, exc.code)
+        fail_step(operation_key, exc.code)
         update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=exc.code)
         raise
 
     except Exception as exc:
         activity.logger.error(f"Unexpected error in probe_video for asset {asset_info.asset_id}: {exc}")
-        if db:
-            fail_step(db, operation_key, str(exc))
+        fail_step(operation_key, str(exc))
         update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=str(exc))
         raise
     finally:
@@ -250,8 +246,7 @@ async def normalize_video(asset_input: dict) -> dict:
     """
     activity.logger.info(f"Starting normalize_video for asset {asset_input['asset_id']}")
 
-    db = get_session()
-    try:
+    with get_session() as db:
         asset = get_asset_status(db, asset_input["asset_id"])
         if asset is None:
             raise RuntimeError("ASSET_NOT_FOUND")
@@ -263,12 +258,8 @@ async def normalize_video(asset_input: dict) -> dict:
             minio_bucket=asset.minio_bucket,
             minio_object_key=asset.minio_object_key,
         )
-    finally:
-        db.close()
 
-    update_asset_state(asset_info.asset_id, ProcessingEvent.PROBE_OK)
-
-    db, operation_key, existing = begin_step(
+    operation_key, existing = begin_step(
         asset_info,
         "normalize",
         tool_version="ffmpeg-normalizer-v1",
@@ -280,8 +271,8 @@ async def normalize_video(asset_input: dict) -> dict:
         return {
             "asset_id": asset_info.asset_id,
             "pipeline_version": asset_info.pipeline_version,
-            "normalized_key": existing.output_key,
-            "normalized_checksum": existing.output_checksum,
+            "normalized_key": existing["output_key"],
+            "normalized_checksum": existing["output_checksum"],
         }
 
     try:
@@ -293,7 +284,7 @@ async def normalize_video(asset_input: dict) -> dict:
         checksum = sha256_file(normalized_path)
         upload = upload_normalized_video(asset_info.asset_id, normalized_path)
 
-        finish_step(db, operation_key, checksum, upload["object_key"])
+        finish_step(operation_key, checksum, upload["object_key"])
 
         update_asset_state(asset_info.asset_id, ProcessingEvent.NORMALIZE_OK, progress=50)
 
@@ -307,8 +298,7 @@ async def normalize_video(asset_input: dict) -> dict:
 
     except Exception as exc:
         activity.logger.error(f"Error in normalize_video for asset {asset_info.asset_id}: {exc}")
-        if db:
-            fail_step(db, operation_key, str(exc))
+        fail_step(operation_key, str(exc))
         update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=str(exc))
         raise
     finally:
@@ -324,8 +314,7 @@ async def extract_audio(asset_input: dict) -> dict:
     """
     activity.logger.info(f"Starting extract_audio for asset {asset_input['asset_id']}")
 
-    db = get_session()
-    try:
+    with get_session() as db:
         asset = get_asset_status(db, asset_input["asset_id"])
         if asset is None:
             raise RuntimeError("ASSET_NOT_FOUND")
@@ -337,12 +326,8 @@ async def extract_audio(asset_input: dict) -> dict:
             minio_bucket=asset.minio_bucket,
             minio_object_key=asset.minio_object_key,
         )
-    finally:
-        db.close()
 
-    update_asset_state(asset_info.asset_id, ProcessingEvent.NORMALIZE_OK)
-
-    db, operation_key, existing = begin_step(
+    operation_key, existing = begin_step(
         asset_info,
         "extract_audio",
         tool_version="ffmpeg-audio-v1",
@@ -354,8 +339,8 @@ async def extract_audio(asset_input: dict) -> dict:
         return {
             "asset_id": asset_info.asset_id,
             "pipeline_version": asset_info.pipeline_version,
-            "audio_key": existing.output_key,
-            "audio_checksum": existing.output_checksum,
+            "audio_key": existing["output_key"],
+            "audio_checksum": existing["output_checksum"],
         }
 
     try:
@@ -370,7 +355,7 @@ async def extract_audio(asset_input: dict) -> dict:
 
         audio_result = extract_audio_file(asset_info.asset_id, normalized_video, work_dir)
 
-        finish_step(db, operation_key, audio_result["checksum"], audio_result["object_key"])
+        finish_step(operation_key, audio_result["checksum"], audio_result["object_key"])
 
         update_asset_state(asset_info.asset_id, ProcessingEvent.AUDIO_OK, progress=90)
 
@@ -384,8 +369,7 @@ async def extract_audio(asset_input: dict) -> dict:
 
     except Exception as exc:
         activity.logger.error(f"Error in extract_audio for asset {asset_info.asset_id}: {exc}")
-        if db:
-            fail_step(db, operation_key, str(exc))
+        fail_step(operation_key, str(exc))
         update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=str(exc))
         raise
     finally:
@@ -401,8 +385,7 @@ async def generate_thumbnail(asset_input: dict) -> dict:
     """
     activity.logger.info(f"Starting generate_thumbnail for asset {asset_input['asset_id']}")
 
-    db = get_session()
-    try:
+    with get_session() as db:
         asset = get_asset_status(db, asset_input["asset_id"])
         if asset is None:
             raise RuntimeError("ASSET_NOT_FOUND")
@@ -414,12 +397,8 @@ async def generate_thumbnail(asset_input: dict) -> dict:
             minio_bucket=asset.minio_bucket,
             minio_object_key=asset.minio_object_key,
         )
-    finally:
-        db.close()
 
-    update_asset_state(asset_info.asset_id, ProcessingEvent.AUDIO_OK)
-
-    db, operation_key, existing = begin_step(
+    operation_key, existing = begin_step(
         asset_info,
         "thumbnail",
         tool_version="ffmpeg-thumbnail-v1",
@@ -431,7 +410,7 @@ async def generate_thumbnail(asset_input: dict) -> dict:
         return {
             "asset_id": asset_info.asset_id,
             "pipeline_version": asset_info.pipeline_version,
-            "thumbnail_key": existing.output_key,
+            "thumbnail_key": existing["output_key"],
         }
 
     try:
@@ -450,7 +429,7 @@ async def generate_thumbnail(asset_input: dict) -> dict:
         checksum = sha256_file(thumbnail_path)
         upload = upload_thumbnail(asset_info.asset_id, thumbnail_path)
 
-        finish_step(db, operation_key, checksum, upload["object_key"])
+        finish_step(operation_key, checksum, upload["object_key"])
 
         update_asset_state(asset_info.asset_id, ProcessingEvent.THUMBNAIL_OK, progress=100)
 
@@ -463,8 +442,7 @@ async def generate_thumbnail(asset_input: dict) -> dict:
 
     except Exception as exc:
         activity.logger.error(f"Error in generate_thumbnail for asset {asset_info.asset_id}: {exc}")
-        if db:
-            fail_step(db, operation_key, str(exc))
+        fail_step(operation_key, str(exc))
         update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=str(exc))
         raise
     finally:
