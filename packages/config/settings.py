@@ -38,12 +38,14 @@ class Settings(BaseSettings):
     SQL_ECHO: bool = False
     SQL_POOL_PRE_PING: bool = True
 
-    # Logging
+     # Logging
     LOG_LEVEL: str = "INFO"
     APP_ENV: str = "development"
 
     # Derived bucket (pour les fichiers transformés)
     DERIVED_BUCKET: str = "media-derived"   # <-- Ajout
+    # Derived bucket for transformed files
+    DERIVED_BUCKET: str = "media-derived"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -53,4 +55,6 @@ class Settings(BaseSettings):
     )
 
 
+
 settings = Settings()
+
