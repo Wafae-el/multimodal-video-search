@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     # Temporal
     TEMPORAL_ADDRESS: str
     TEMPORAL_TASK_QUEUE: str = "video-processing"
+    # Thread-pool size for synchronous (blocking) activities.
+    WORKER_ACTIVITY_THREADS: int = 8
+    # Grace period for in-flight activities on worker shutdown (seconds).
+    WORKER_GRACEFUL_SHUTDOWN_SECONDS: int = 30
 
     # Qdrant
     QDRANT_URL: str
@@ -30,6 +34,9 @@ class Settings(BaseSettings):
     ALLOWED_CONTENT_TYPES: str = (
         "video/mp4,video/x-matroska,video/quicktime,video/x-msvideo"
     )
+    ALLOWED_EXTENSIONS: str = "mp4,mkv,mov,avi"
+    # Optional maximum media duration in seconds (None disables the check).
+    MAX_DURATION_SECONDS: int | None = None
 
     # Pipeline
     PIPELINE_VERSION: str = "v1"
@@ -38,13 +45,11 @@ class Settings(BaseSettings):
     SQL_ECHO: bool = False
     SQL_POOL_PRE_PING: bool = True
 
-     # Logging
+    # Logging
     LOG_LEVEL: str = "INFO"
     APP_ENV: str = "development"
 
-    # Derived bucket (pour les fichiers transformés)
-    DERIVED_BUCKET: str = "media-derived"   # <-- Ajout
-    # Derived bucket for transformed files
+    # Derived bucket for transformed files (normalized video, audio, thumbnails)
     DERIVED_BUCKET: str = "media-derived"
 
     model_config = SettingsConfigDict(

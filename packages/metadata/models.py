@@ -16,7 +16,7 @@ from packages.metadata.database import Base
 
 
 class Video(Base):
-    __tablename__ = "videos"
+    __tablename__ = "media_assets"
 
     id = Column(Integer, primary_key=True, index=True)
 
@@ -87,7 +87,7 @@ class MediaFile(Base):
 
     video_id = Column(
         Integer,
-        ForeignKey("videos.id", ondelete="CASCADE"),
+        ForeignKey("media_assets.id", ondelete="CASCADE"),
         nullable=False,
     )
 
@@ -124,13 +124,19 @@ class ProcessingStep(Base):
 
     video_id = Column(
         Integer,
-        ForeignKey("videos.id", ondelete="CASCADE"),
+        ForeignKey("media_assets.id", ondelete="CASCADE"),
         nullable=False,
     )
 
     step_name = Column(String, nullable=False)
 
     step_version = Column(String, nullable=False)
+
+    # Tool/model version and input checksum are part of the idempotency identity
+    # and are also folded into operation_key.
+    tool_version = Column(String)
+
+    input_checksum = Column(String)
 
     operation_key = Column(
         String,
@@ -147,6 +153,8 @@ class ProcessingStep(Base):
         Integer,
         default=0,
     )
+
+    output_bucket = Column(String)
 
     output_key = Column(String)
 

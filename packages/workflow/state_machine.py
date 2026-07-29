@@ -75,3 +75,38 @@ def next_state(state: ProcessingState, event: ProcessingEvent) -> ProcessingStat
         raise ValueError(f"Invalid transition: {state} + {event}")
 
     return transitions[(state, event)]
+
+
+# ---------------------------------------------------------------------------
+# Idempotent, monotonic advancement (used for Temporal-retry safety).
+#
+# ``next_state`` above is strict and rejects any transition that is not the
+# exact expected one — which is correct for validating a single event, but a
+# retried activity may find the asset already advanced (VALIDATING, PROBING,
+# FAILED, ...). To stay retry-safe we advance along a linear ordering and treat
+# "already at or past the target" as a no-op instead of an error.
+# ---------------------------------------------------------------------------
+
+STATE_ORDER = [
+    ProcessingState.UPLOADED,
+    ProcessingState.VALIDATING,
+    ProcessingState.PROBING,
+    ProcessingState.NORMALIZING,
+    ProcessingState.EXTRACTING_AUDIO,
+    ProcessingState.GENERATING_THUMBNAIL,
+    ProcessingState.DONE,
+]
+STATE_RANK = {state: index for index, state in enumerate(STATE_ORDER)}
+
+TERMINAL_STATES = {
+    ProcessingState.DONE,
+    ProcessingState.FAILED,
+    ProcessingState.NO_AUDIO,
+}
+
+
+def is_at_or_past(current: ProcessingState, target: ProcessingState) -> bool:
+    """True if ``current`` is the same as, or further along than, ``target``."""
+    if current not in STATE_RANK or target not in STATE_RANK:
+        return False
+    return STATE_RANK[current] >= STATE_RANK[target]

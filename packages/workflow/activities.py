@@ -1,23 +1,19 @@
 import hashlib
-import json
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
-from packages.config.settings import settings
 from packages.metadata.database import get_session
-from packages.metadata.crud import (
-    get_asset_status,
-    start_processing_step,
-    complete_processing_step,
-    fail_processing_step,
-    reuse_completed_operation,
-)
+from packages.metadata import crud
 from packages.media.ffprobe_service import (
     analyze_video,
     MediaValidationError,
+    verify_video_output,
+    verify_audio_output,
 )
 from packages.media.normalizer import normalize_video as normalize_video_file
 from packages.media.thumbnail_service import generate_thumbnail as generate_thumbnail_file
@@ -26,21 +22,21 @@ from packages.storage.minio_service import (
     download_file,
     upload_thumbnail,
     upload_normalized_video,
+    object_exists,
+    build_proxy_object_key,
 )
-from packages.workflow.state_machine import ProcessingState, ProcessingEvent, next_state
+from packages.workflow.state_machine import ProcessingState
+from packages.workflow.operation_key import build_operation_key  # re-exported for callers/tests
+from packages.workflow.contracts import ProcessAssetInput, ACTIVITY_MAX_ATTEMPTS
 
 
-PIPELINE_VERSION = "v1"
 WORKSPACE_ROOT = Path("workspace")
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
-
-# Utilisé dans extract_audio et generate_thumbnail
-DERIVED_BUCKET = getattr(settings, "DERIVED_BUCKET", "media-derived")
 
 
 @dataclass
 class AssetInfo:
-    """Objet immuable contenant les seules données nécessaires."""
+    """Only the data an activity needs — no binary payloads or blobs."""
     id: int
     asset_id: str
     source_checksum: str
@@ -57,394 +53,338 @@ def sha256_file(file_path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_operation_key(checksum: str, step: str, version: str, tool_version: str) -> str:
-    """
-    Clé canonique basée sur un dictionnaire trié, pour éviter les collisions.
-    """
-    data = {
-        "checksum": checksum,
-        "step": step,
-        "version": version,
-        "tool_version": tool_version,
-    }
-    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def workspace(asset_id: str) -> Path:
-    path = WORKSPACE_ROOT / asset_id
+def workspace(asset_id: str, operation_key: str) -> Path:
+    """One isolated workspace per asset AND operation key, so concurrent or
+    retried steps never collide."""
+    path = WORKSPACE_ROOT / asset_id / operation_key[:16]
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def download_original_video(asset_info: AssetInfo) -> Path:
-    root = workspace(asset_info.asset_id)
-    local_video = root / "original.mp4"
-    # Appel avec 2 paramètres : object_key et destination (le bucket est déjà configuré dans minio_service)
-    download_file(asset_info.minio_object_key, local_video)
-    return local_video
+def _log_context(asset_id: str, step_name: str, operation_key: str) -> dict:
+    """Structured log fields: asset_id, workflow_id, activity, operation_key, attempt."""
+    workflow_id = None
+    attempt = None
+    try:
+        info = activity.info()
+        workflow_id = info.workflow_id
+        attempt = info.attempt
+    except Exception:  # not in an activity context (should not happen in prod)
+        pass
+    return {
+        "asset_id": asset_id,
+        "workflow_id": workflow_id,
+        "activity": step_name,
+        "operation_key": operation_key,
+        "attempt": attempt,
+    }
 
 
-def begin_step(asset_info: AssetInfo, step_name: str, tool_version: str = "1.0"):
-    operation_key = build_operation_key(
-        asset_info.source_checksum,
-        step_name,
-        asset_info.pipeline_version,
-        tool_version,
-    )
+def _load_asset_info(asset_id: str) -> AssetInfo:
     with get_session() as db:
-        existing = reuse_completed_operation(db, operation_key)
-        if existing:
-            return (
-                operation_key,
-                {
-                    "output_key": existing.output_key,
-                    "output_checksum": existing.output_checksum,
-                },
-            )
+        asset = crud.get_asset_status(db, asset_id)
+        if asset is None:
+            raise ApplicationError("ASSET_NOT_FOUND", type="AssetNotFound", non_retryable=True)
+        return AssetInfo(
+            id=asset.id,
+            asset_id=asset.asset_id,
+            source_checksum=asset.source_checksum,
+            pipeline_version=asset.pipeline_version,
+            minio_bucket=asset.minio_bucket,
+            minio_object_key=asset.minio_object_key,
+        )
 
-        start_processing_step(
-            db=db,
-            video_id=asset_info.id,
+
+def download_original_video(info: AssetInfo, workdir: Path) -> Path:
+    local = workdir / "original"
+    download_file(info.minio_object_key, local)
+    return local
+
+
+def _ensure_proxy(info: AssetInfo, workdir: Path) -> Path:
+    proxy = workdir / "proxy.mp4"
+    if not proxy.exists():
+        download_file(build_proxy_object_key(info.asset_id), proxy)
+    return proxy
+
+
+def _result(asset_id: str, pipeline_version: str, data: dict, reused: bool) -> dict:
+    # Only stable strings are returned into Temporal history.
+    return {
+        "asset_id": asset_id,
+        "pipeline_version": pipeline_version,
+        "output_key": data.get("output_key"),
+        "output_checksum": data.get("output_checksum"),
+        "reused": reused,
+    }
+
+
+def _run_step(
+    request: ProcessAssetInput,
+    *,
+    step_name: str,
+    tool_version: str,
+    start_states,
+    done_state: ProcessingState,
+    done_progress,
+    work,
+) -> dict:
+    """Shared retry-safe, idempotent scaffolding for every activity.
+
+    Flow: load asset -> idempotently enter the step's state(s) -> compute the
+    operation key -> begin/resume/reuse the step -> if already completed and the
+    artifact still exists, return it without re-running FFmpeg -> otherwise do the
+    work, verify the written object, mark the step complete and advance the asset
+    state. Failures are retryable by default; terminal FAILED is written only for
+    non-retryable errors or once retries are exhausted.
+    """
+    asset_id = request.asset_id
+    info = _load_asset_info(asset_id)
+
+    operation_key = build_operation_key(
+        info.source_checksum, step_name, info.pipeline_version, tool_version
+    )
+    ctx = _log_context(asset_id, step_name, operation_key)
+
+    # Enter this step's in-progress state(s). Monotonic + idempotent, so a retry
+    # that finds the asset already advanced does not raise an invalid transition.
+    with get_session() as db:
+        for state in start_states:
+            crud.advance_asset_state(db, asset_id, target=state)
+
+    with get_session() as db:
+        step = crud.begin_or_resume_step(
+            db,
+            video_id=info.id,
             step_name=step_name,
-            step_version=asset_info.pipeline_version,
+            step_version=info.pipeline_version,
+            tool_version=tool_version,
+            input_checksum=info.source_checksum,
             operation_key=operation_key,
         )
-    return (operation_key, None)
 
-
-def finish_step(operation_key, checksum, object_key):
-    with get_session() as db:
-        complete_processing_step(db, operation_key, object_key, checksum)
-
-
-def fail_step(operation_key, error):
-    with get_session() as db:
-        fail_processing_step(db, operation_key, str(error))
-
-
-def update_asset_state(asset_id: str, event: ProcessingEvent, progress: int = None, error: str = None):
-    """
-    Applique la transition d'état définie dans la machine à états,
-    puis met à jour l'asset en base.
-    """
-    with get_session() as db:
-        asset = get_asset_status(db, asset_id)
-        if asset is None:
-            raise RuntimeError(f"Asset {asset_id} not found")
-
-        current_state = ProcessingState(asset.status)
-        try:
-            new_state = next_state(current_state, event)
-        except ValueError as e:
-            activity.logger.error(f"Invalid transition: {current_state} + {event} for asset {asset_id}")
-            raise
-
-        asset.status = new_state.value
-        if progress is not None:
-            asset.progress = progress
-        if error is not None:
-            asset.last_error = error
-        else:
-            asset.last_error = None
-
-        activity.logger.info(f"Asset {asset_id} transitioned from {current_state.value} to {new_state.value} via {event.value}")
-
-
-# ---------- Activités ----------
-@activity.defn
-async def probe_video(asset_input: dict) -> dict:
-    """
-    Validate the original media and persist the probing result.
-    This activity is idempotent.
-    """
-    activity.logger.info(f"Starting probe_video for asset {asset_input['asset_id']}")
-
-    with get_session() as db:
-        asset = get_asset_status(db, asset_input["asset_id"])
-        if asset is None:
-            raise RuntimeError("ASSET_NOT_FOUND")
-        asset_info = AssetInfo(
-            id=asset.id,
-            asset_id=asset.asset_id,
-            source_checksum=asset.source_checksum,
-            pipeline_version=asset.pipeline_version,
-            minio_bucket=asset.minio_bucket,
-            minio_object_key=asset.minio_object_key,
+    # Duplicate delivery / output-exists: a completed step whose artifact still
+    # exists is reused as-is — FFmpeg is never invoked again and the attempt count
+    # is not increased.
+    if step["status"] == "completed":
+        if not step["output_key"] or object_exists(step["output_key"]):
+            with get_session() as db:
+                crud.advance_asset_state(db, asset_id, target=done_state, progress=done_progress)
+            activity.logger.info(
+                "reusing completed output asset=%s op=%s", asset_id, operation_key, extra=ctx
+            )
+            return _result(asset_id, info.pipeline_version, step, reused=True)
+        activity.logger.warning(
+            "completed output missing; recomputing asset=%s op=%s", asset_id, operation_key, extra=ctx
         )
 
-    # --- Correction 2 : deux transitions successives pour respecter la machine ---
-    # UPLOADED --UPLOAD_COMPLETE--> VALIDATING --VALIDATION_OK--> PROBING
-    update_asset_state(asset_info.asset_id, ProcessingEvent.UPLOAD_COMPLETE)
-    update_asset_state(asset_info.asset_id, ProcessingEvent.VALIDATION_OK)
-
-    operation_key, existing = begin_step(
-        asset_info,
-        "probe",
-        tool_version="ffprobe-1",
+    # A "run" outcome bumped attempts; keep logs in sync with the actual attempt.
+    activity.logger.info(
+        "activity execution begin asset=%s op=%s", asset_id, operation_key, extra=ctx
     )
 
-    if existing:
-        activity.logger.info(f"Probe step already completed for asset {asset_info.asset_id}, reusing result")
-        update_asset_state(asset_info.asset_id, ProcessingEvent.PROBE_OK)
-        return {
-            "asset_id": asset_info.asset_id,
-            "pipeline_version": asset_info.pipeline_version,
-            "probe_checksum": existing["output_checksum"],
-            "probe_key": existing["output_key"],
-        }
+    # Heartbeat from a background thread while the blocking work runs, so if the
+    # worker is killed mid-activity Temporal detects it within heartbeat_timeout
+    # and reschedules the (idempotent) activity instead of waiting for
+    # start_to_close_timeout.
+    stop_heartbeat = threading.Event()
 
+    def _heartbeat_loop():
+        while not stop_heartbeat.wait(2.0):
+            try:
+                activity.heartbeat()
+            except Exception:
+                return
+
+    heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
+
+    workdir = workspace(asset_id, operation_key)
     try:
-        local_video = download_original_video(asset_info)
-        metadata = analyze_video(local_video)
+        result = work(info, workdir)
 
-        probe_file = workspace(asset_info.asset_id) / "probe.json"
-        probe_file.write_text(
-            "{\n"
-            f'  "duration": {metadata.duration},\n'
-            f'  "codec": "{metadata.video_codec}",\n'
-            f'  "width": {metadata.width},\n'
-            f'  "height": {metadata.height},\n'
-            f'  "has_audio": {str(metadata.has_audio).lower()}\n'
-            "}"
+        # Verify the written object exists before marking the step complete.
+        if result.get("output_key") and not object_exists(result["output_key"]):
+            raise RuntimeError("OUTPUT_VERIFICATION_FAILED")
+
+        with get_session() as db:
+            crud.complete_step(
+                db, operation_key,
+                output_bucket=result.get("output_bucket"),
+                output_key=result.get("output_key"),
+                output_checksum=result.get("output_checksum"),
+            )
+            # Persist a media_files record for a produced artifact (idempotent).
+            if result.get("file_type") and result.get("output_key"):
+                crud.register_media_file(
+                    db,
+                    video_id=info.id,
+                    file_type=result["file_type"],
+                    bucket=result.get("output_bucket"),
+                    object_key=result["output_key"],
+                    checksum=result.get("output_checksum"),
+                )
+            crud.advance_asset_state(db, asset_id, target=done_state, progress=done_progress)
+
+        activity.logger.info(
+            "activity completed asset=%s op=%s", asset_id, operation_key, extra=ctx
         )
-
-        checksum = sha256_file(probe_file)
-        finish_step(operation_key, checksum, None)
-
-        update_asset_state(asset_info.asset_id, ProcessingEvent.PROBE_OK)
-
-        activity.logger.info(f"Probe successful for asset {asset_info.asset_id}")
-        return {
-            "asset_id": asset_info.asset_id,
-            "pipeline_version": asset_info.pipeline_version,
-            "probe_checksum": checksum,
-            "probe_key": None,
-        }
+        return _result(asset_id, info.pipeline_version, result, reused=False)
 
     except MediaValidationError as exc:
-        activity.logger.error(f"Media validation error for asset {asset_info.asset_id}: {exc.code}")
-        fail_step(operation_key, exc.code)
-        update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=exc.code)
-        raise
+        # Bad media never succeeds on retry -> non-retryable, terminal FAILED.
+        with get_session() as db:
+            crud.fail_step(db, operation_key, error=exc.code)
+            crud.mark_asset_failed(
+                db, asset_id, status=ProcessingState.FAILED.value, error_code=exc.code
+            )
+        activity.logger.warning(
+            "activity failed (non-retryable) asset=%s op=%s: %s",
+            asset_id, operation_key, exc.code, extra=ctx,
+        )
+        raise ApplicationError(exc.code, type="MediaValidationError", non_retryable=True)
 
     except Exception as exc:
-        activity.logger.error(f"Unexpected error in probe_video for asset {asset_info.asset_id}: {exc}")
-        fail_step(operation_key, str(exc))
-        update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=str(exc))
+        message = f"{step_name}:{type(exc).__name__}:{str(exc)[:300]}"
+        last_attempt = activity.info().attempt >= ACTIVITY_MAX_ATTEMPTS
+        with get_session() as db:
+            crud.fail_step(db, operation_key, error=message)
+            if last_attempt:
+                # Retries exhausted -> terminal failure.
+                crud.mark_asset_failed(
+                    db, asset_id, status=ProcessingState.FAILED.value, error_code=message
+                )
+            else:
+                # Retryable: keep the current state and let Temporal retry.
+                crud.set_asset_error(db, asset_id, error_code=message)
+        activity.logger.warning(
+            "activity failed asset=%s op=%s last_attempt=%s: %s",
+            asset_id, operation_key, last_attempt, message, extra=ctx,
+        )
         raise
     finally:
-        work_dir = workspace(asset_info.asset_id)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        stop_heartbeat.set()
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------- Work functions (the actual FFmpeg / ffprobe steps) ----------
+def _probe_json(metadata) -> str:
+    return (
+        "{\n"
+        f'  "duration": {metadata.duration},\n'
+        f'  "codec": "{metadata.video_codec}",\n'
+        f'  "width": {metadata.width},\n'
+        f'  "height": {metadata.height},\n'
+        f'  "has_audio": {str(metadata.has_audio).lower()}\n'
+        "}"
+    )
+
+
+def _do_probe(info: AssetInfo, workdir: Path) -> dict:
+    local_video = download_original_video(info, workdir)
+    metadata = analyze_video(local_video)  # validates JSON + video stream
+    probe_file = workdir / "probe.json"
+    probe_file.write_text(_probe_json(metadata))
+    return {
+        "output_bucket": None,
+        "output_key": None,
+        "output_checksum": sha256_file(probe_file),
+        "file_type": None,
+    }
+
+
+def _do_normalize(info: AssetInfo, workdir: Path) -> dict:
+    local_video = download_original_video(info, workdir)
+    proxy = workdir / "proxy.mp4"
+    normalize_video_file(local_video, proxy)
+    verify_video_output(proxy)  # ffprobe: the proxy is a real decodable video
+    checksum = sha256_file(proxy)
+    upload = upload_normalized_video(info.asset_id, proxy)
+    return {
+        "output_bucket": upload["bucket"],
+        "output_key": upload["object_key"],
+        "output_checksum": checksum,
+        "file_type": "proxy",
+    }
+
+
+def _do_extract_audio(info: AssetInfo, workdir: Path) -> dict:
+    proxy = _ensure_proxy(info, workdir)
+    audio = extract_audio_file(info.asset_id, proxy, workdir)
+    verify_audio_output(audio["path"])  # ffprobe: PCM s16le / 16 kHz / mono
+    return {
+        "output_bucket": audio.get("bucket"),
+        "output_key": audio["object_key"],
+        "output_checksum": audio["checksum"],
+        "file_type": "audio",
+    }
+
+
+def _do_thumbnail(info: AssetInfo, workdir: Path) -> dict:
+    proxy = _ensure_proxy(info, workdir)
+    thumbnail = workdir / "thumbnail.jpg"
+    generate_thumbnail_file(proxy, thumbnail)  # raises if missing/empty
+    checksum = sha256_file(thumbnail)
+    upload = upload_thumbnail(info.asset_id, thumbnail)
+    return {
+        "output_bucket": upload["bucket"],
+        "output_key": upload["object_key"],
+        "output_checksum": checksum,
+        "file_type": "thumbnail",
+    }
+
+
+# ---------- Activities ----------
+# Synchronous activities: the blocking FFmpeg/ffprobe/MinIO work runs on the
+# worker's thread-pool executor (configured in workers/ingestion/worker.py), so
+# a long job never blocks the Temporal event loop.
+@activity.defn
+def probe_video(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="probe",
+        tool_version="ffprobe-1",
+        start_states=[ProcessingState.VALIDATING, ProcessingState.PROBING],
+        done_state=ProcessingState.NORMALIZING,
+        done_progress=None,
+        work=_do_probe,
+    )
 
 
 @activity.defn
-async def normalize_video(asset_input: dict) -> dict:
-    """
-    Normalize the original video into a standard MP4 format.
-    This activity is idempotent.
-    """
-    activity.logger.info(f"Starting normalize_video for asset {asset_input['asset_id']}")
-
-    with get_session() as db:
-        asset = get_asset_status(db, asset_input["asset_id"])
-        if asset is None:
-            raise RuntimeError("ASSET_NOT_FOUND")
-        asset_info = AssetInfo(
-            id=asset.id,
-            asset_id=asset.asset_id,
-            source_checksum=asset.source_checksum,
-            pipeline_version=asset.pipeline_version,
-            minio_bucket=asset.minio_bucket,
-            minio_object_key=asset.minio_object_key,
-        )
-
-    operation_key, existing = begin_step(
-        asset_info,
-        "normalize",
+def normalize_video(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="normalize",
         tool_version="ffmpeg-normalizer-v1",
+        start_states=[ProcessingState.NORMALIZING],
+        done_state=ProcessingState.EXTRACTING_AUDIO,
+        done_progress=50,
+        work=_do_normalize,
     )
-
-    if existing:
-        activity.logger.info(f"Normalize step already completed for asset {asset_info.asset_id}, reusing result")
-        update_asset_state(asset_info.asset_id, ProcessingEvent.NORMALIZE_OK, progress=50)
-        return {
-            "asset_id": asset_info.asset_id,
-            "pipeline_version": asset_info.pipeline_version,
-            "normalized_key": existing["output_key"],
-            "normalized_checksum": existing["output_checksum"],
-        }
-
-    try:
-        local_video = download_original_video(asset_info)
-        output_dir = workspace(asset_info.asset_id)
-        normalized_path = output_dir / "normalized.mp4"
-        normalize_video_file(local_video, normalized_path)
-
-        checksum = sha256_file(normalized_path)
-        upload = upload_normalized_video(asset_info.asset_id, normalized_path)
-
-        finish_step(operation_key, checksum, upload["object_key"])
-
-        update_asset_state(asset_info.asset_id, ProcessingEvent.NORMALIZE_OK, progress=50)
-
-        activity.logger.info(f"Normalize successful for asset {asset_info.asset_id}")
-        return {
-            "asset_id": asset_info.asset_id,
-            "pipeline_version": asset_info.pipeline_version,
-            "normalized_key": upload["object_key"],
-            "normalized_checksum": checksum,
-        }
-
-    except Exception as exc:
-        activity.logger.error(f"Error in normalize_video for asset {asset_info.asset_id}: {exc}")
-        fail_step(operation_key, str(exc))
-        update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=str(exc))
-        raise
-    finally:
-        work_dir = workspace(asset_info.asset_id)
-        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @activity.defn
-async def extract_audio(asset_input: dict) -> dict:
-    """
-    Extract PCM mono 16 kHz WAV audio from the normalized video.
-    This activity is idempotent.
-    """
-    activity.logger.info(f"Starting extract_audio for asset {asset_input['asset_id']}")
-
-    with get_session() as db:
-        asset = get_asset_status(db, asset_input["asset_id"])
-        if asset is None:
-            raise RuntimeError("ASSET_NOT_FOUND")
-        asset_info = AssetInfo(
-            id=asset.id,
-            asset_id=asset.asset_id,
-            source_checksum=asset.source_checksum,
-            pipeline_version=asset.pipeline_version,
-            minio_bucket=asset.minio_bucket,
-            minio_object_key=asset.minio_object_key,
-        )
-
-    operation_key, existing = begin_step(
-        asset_info,
-        "extract_audio",
+def extract_audio(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="extract_audio",
         tool_version="ffmpeg-audio-v1",
+        start_states=[ProcessingState.EXTRACTING_AUDIO],
+        done_state=ProcessingState.GENERATING_THUMBNAIL,
+        done_progress=90,
+        work=_do_extract_audio,
     )
-
-    if existing:
-        activity.logger.info(f"Extract_audio step already completed for asset {asset_info.asset_id}, reusing result")
-        update_asset_state(asset_info.asset_id, ProcessingEvent.AUDIO_OK, progress=90)
-        return {
-            "asset_id": asset_info.asset_id,
-            "pipeline_version": asset_info.pipeline_version,
-            "audio_key": existing["output_key"],
-            "audio_checksum": existing["output_checksum"],
-        }
-
-    try:
-        work_dir = workspace(asset_info.asset_id)
-        normalized_video = work_dir / "normalized.mp4"
-        if not normalized_video.exists():
-            # Correction 1 : appel avec un seul argument object_key (bucket par défaut)
-            download_file(
-                f"media-derived/{asset_info.asset_id}/normalized/video.mp4",
-                normalized_video,
-            )
-
-        audio_result = extract_audio_file(asset_info.asset_id, normalized_video, work_dir)
-
-        finish_step(operation_key, audio_result["checksum"], audio_result["object_key"])
-
-        update_asset_state(asset_info.asset_id, ProcessingEvent.AUDIO_OK, progress=90)
-
-        activity.logger.info(f"Audio extraction successful for asset {asset_info.asset_id}")
-        return {
-            "asset_id": asset_info.asset_id,
-            "pipeline_version": asset_info.pipeline_version,
-            "audio_key": audio_result["object_key"],
-            "audio_checksum": audio_result["checksum"],
-        }
-
-    except Exception as exc:
-        activity.logger.error(f"Error in extract_audio for asset {asset_info.asset_id}: {exc}")
-        fail_step(operation_key, str(exc))
-        update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=str(exc))
-        raise
-    finally:
-        work_dir = workspace(asset_info.asset_id)
-        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @activity.defn
-async def generate_thumbnail(asset_input: dict) -> dict:
-    """
-    Generate the default thumbnail.
-    This activity is idempotent.
-    """
-    activity.logger.info(f"Starting generate_thumbnail for asset {asset_input['asset_id']}")
-
-    with get_session() as db:
-        asset = get_asset_status(db, asset_input["asset_id"])
-        if asset is None:
-            raise RuntimeError("ASSET_NOT_FOUND")
-        asset_info = AssetInfo(
-            id=asset.id,
-            asset_id=asset.asset_id,
-            source_checksum=asset.source_checksum,
-            pipeline_version=asset.pipeline_version,
-            minio_bucket=asset.minio_bucket,
-            minio_object_key=asset.minio_object_key,
-        )
-
-    operation_key, existing = begin_step(
-        asset_info,
-        "thumbnail",
+def generate_thumbnail(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="thumbnail",
         tool_version="ffmpeg-thumbnail-v1",
+        start_states=[ProcessingState.GENERATING_THUMBNAIL],
+        done_state=ProcessingState.DONE,
+        done_progress=100,
+        work=_do_thumbnail,
     )
-
-    if existing:
-        activity.logger.info(f"Thumbnail step already completed for asset {asset_info.asset_id}, reusing result")
-        update_asset_state(asset_info.asset_id, ProcessingEvent.THUMBNAIL_OK, progress=100)
-        return {
-            "asset_id": asset_info.asset_id,
-            "pipeline_version": asset_info.pipeline_version,
-            "thumbnail_key": existing["output_key"],
-        }
-
-    try:
-        work_dir = workspace(asset_info.asset_id)
-        normalized_video = work_dir / "normalized.mp4"
-        if not normalized_video.exists():
-            # Correction 1 : appel avec un seul argument object_key
-            download_file(
-                f"media-derived/{asset_info.asset_id}/normalized/video.mp4",
-                normalized_video,
-            )
-
-        thumbnail_path = work_dir / "thumbnail.jpg"
-        generate_thumbnail_file(normalized_video, thumbnail_path)
-
-        checksum = sha256_file(thumbnail_path)
-        upload = upload_thumbnail(asset_info.asset_id, thumbnail_path)
-
-        finish_step(operation_key, checksum, upload["object_key"])
-
-        update_asset_state(asset_info.asset_id, ProcessingEvent.THUMBNAIL_OK, progress=100)
-
-        activity.logger.info(f"Thumbnail generation successful for asset {asset_info.asset_id}")
-        return {
-            "asset_id": asset_info.asset_id,
-            "pipeline_version": asset_info.pipeline_version,
-            "thumbnail_key": upload["object_key"],
-        }
-
-    except Exception as exc:
-        activity.logger.error(f"Error in generate_thumbnail for asset {asset_info.asset_id}: {exc}")
-        fail_step(operation_key, str(exc))
-        update_asset_state(asset_info.asset_id, ProcessingEvent.ERROR, error=str(exc))
-        raise
-    finally:
-        work_dir = workspace(asset_info.asset_id)
-        shutil.rmtree(work_dir, ignore_errors=True)

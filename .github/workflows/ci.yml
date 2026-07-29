@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feature/week-1-ingestion-foundation]
+  pull_request:
+
+jobs:
+  lint-test-migrate:
+    name: Lint, unit tests, migration validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt ruff
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Documentation check (no patch/diff artifacts)
+        run: |
+          if grep -REn '^(diff --git|@@ |\+\+\+ |--- a/|git apply|<<<<<<<|>>>>>>>)' README.md docs/ ; then
+            echo "Malformed documentation: patch/diff artifacts found" >&2
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: pytest tests/unit -v
+
+      - name: Kata tests
+        run: pytest tests/katas -v
+
+      - name: Self-contained integration tests (mocked services)
+        run: pytest tests/integration/test_upload.py tests/integration/test_idempotency.py -v
+
+      - name: Migration validation (upgrade head + downgrade base)
+        env:
+          DATABASE_URL: sqlite:///./ci.db
+          MINIO_ENDPOINT: localhost:9000
+          MINIO_ACCESS_KEY: ci
+          MINIO_SECRET_KEY: ci
+          MINIO_BUCKET: media
+          TEMPORAL_ADDRESS: localhost:7233
+          QDRANT_URL: http://localhost:6333
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t multimodal-video-search:ci .
+
+  integration:
+    name: Real-service integration tests
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_PROJECT_NAME: infrastructure
+      COMPOSE_FILE: infrastructure/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env
+        run: cp .env.example .env
+
+      - name: Build and start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for API to become healthy
+        run: |
+          for i in $(seq 1 40); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' video_api 2>/dev/null || echo starting)
+            echo "api health: $status"
+            [ "$status" = "healthy" ] && exit 0
+            sleep 5
+          done
+          echo "API did not become healthy" >&2
+          docker compose logs api >&2 || true
+          exit 1
+
+      - name: Apply migrations
+        run: docker compose run --rm api python -m scripts.init_db
+
+      - name: Run integration tests
+        run: |
+          docker run --rm --network infrastructure_default \
+            -v "$PWD:/app" -w /app \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e INTEGRATION=1 \
+            -e DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/video_search \
+            -e MINIO_ENDPOINT=minio:9000 -e MINIO_ACCESS_KEY=minioadmin \
+            -e MINIO_SECRET_KEY=minioadmin -e MINIO_BUCKET=media \
+            -e TEMPORAL_ADDRESS=temporal:7233 -e QDRANT_URL=http://qdrant:6333 \
+            -e API_BASE_URL=http://api:8000 \
+            infrastructure-worker:latest \
+            sh -c "pip install -q docker && pytest tests/integration -m integration -v"
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs >&2 || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

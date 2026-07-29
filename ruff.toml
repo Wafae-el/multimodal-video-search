@@ -1,0 +1,12 @@
+target-version = "py312"
+line-length = 100
+
+# Default rule set (pyflakes `F` + pycodestyle `E`/`W` basics). Line-length is
+# not enforced to avoid churn on long descriptive strings.
+[lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# Migrations are largely auto-generated.
+"alembic/versions/*" = ["E", "W"]

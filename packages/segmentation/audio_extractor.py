@@ -69,8 +69,10 @@ def extract_audio(
     try:
         subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=FFMPEG_TIMEOUT,
             check=True,
         )
@@ -80,9 +82,10 @@ def extract_audio(
             "FFMPEG_TIMEOUT"
         )
 
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()[-500:]
         raise AudioExtractionError(
-            "AUDIO_EXTRACTION_FAILED"
+            f"AUDIO_EXTRACTION_FAILED: {stderr}"
         )
 
     if not audio_path.exists():

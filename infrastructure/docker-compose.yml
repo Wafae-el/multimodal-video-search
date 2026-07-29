@@ -1,20 +1,23 @@
-version: '3.8'
+# All application configuration is passed through the environment (../.env).
+# Copy ../.env.example to ../.env before running `docker compose up`.
+# Interpolated values below provide non-secret development defaults so that
+# `docker compose config` succeeds even without a root .env file.
 
 services:
   postgres:
-    image: postgres:17
+    image: postgres:17.2
     container_name: postgres_db
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-video_search}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
-      - "${POSTGRES_PORT}:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-video_search}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -24,12 +27,12 @@ services:
     container_name: minio
     restart: unless-stopped
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     command: server /data --console-address ":9001"
     ports:
-      - "${MINIO_API_PORT}:9000"
-      - "${MINIO_CONSOLE_PORT}:9001"
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -43,11 +46,11 @@ services:
     container_name: qdrant
     restart: unless-stopped
     ports:
-      - "${QDRANT_PORT}:6333"
+      - "${QDRANT_PORT:-6333}:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -59,28 +62,33 @@ services:
     environment:
       DB: postgres12
       DB_PORT: 5432
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_SEEDS: postgres
     ports:
-      - "${TEMPORAL_GRPC_PORT:-7233}:7233"   # Port gRPC pour l'adresse TEMPORAL_ADDRESS
-      - "${TEMPORAL_UI_PORT:-8080}:8080"     # Interface Web
+      - "${TEMPORAL_GRPC_PORT:-7233}:7233"   # gRPC endpoint (TEMPORAL_ADDRESS)
+      - "${TEMPORAL_UI_PORT:-8080}:8080"     # Web UI
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "tctl", "cluster", "health"]
+      # The frontend binds gRPC to the container address (not 127.0.0.1), so the
+      # health probe must target the service address explicitly.
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
       interval: 15s
       timeout: 10s
       retries: 10
 
   api:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: video_api
     restart: unless-stopped
     command: uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
     env_file:
-      - ../.env
+      - path: ../.env
+        required: false
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -90,8 +98,6 @@ services:
         condition: service_healthy
       temporal:
         condition: service_healthy
-      qdrant:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/"]
       interval: 30s
@@ -99,12 +105,15 @@ services:
       retries: 3
 
   worker:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: video_worker
     restart: unless-stopped
-    command: python workers/ingestion/worker.py
+    command: python -m workers.ingestion.worker
     env_file:
-      - ../.env
+      - path: ../.env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -112,10 +121,8 @@ services:
         condition: service_healthy
       temporal:
         condition: service_healthy
-      qdrant:
-        condition: service_healthy
-    # Pas de healthcheck : le worker est un processus long sans endpoint HTTP,
-    # et son bon fonctionnement est vérifié indirectement via les logs et le monitoring.
+    # No HTTP endpoint to health-check; the worker is a long-running process
+    # whose health is observed via logs and Temporal task-queue pollers.
 
 volumes:
   postgres_data:

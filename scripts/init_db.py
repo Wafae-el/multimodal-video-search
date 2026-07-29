@@ -1,26 +1,40 @@
-import os
+"""Initialize the database schema.
 
+This is the single official initialization path and it runs
+``alembic upgrade head``. It intentionally does NOT call
+``Base.metadata.create_all()``: the schema is owned by Alembic so that
+development and production stay identical and migrations remain the source of
+truth.
 
-LOCAL_INIT_ENV = {
-    "DATABASE_URL": "sqlite:///./test.db",
-    "MINIO_ENDPOINT": "localhost:9000",
-    "MINIO_ACCESS_KEY": "minioadmin",
-    "MINIO_SECRET_KEY": "minioadmin",
-    "MINIO_BUCKET": "media",
-    "TEMPORAL_ADDRESS": "localhost:7233",
-    "QDRANT_URL": "http://localhost:6333",
-}
+Alembic reads the database connection from the typed application settings
+(``DATABASE_URL``) via ``alembic/env.py``. Requires the application environment
+to be configured (see .env.example).
 
-for name, value in LOCAL_INIT_ENV.items():
-    os.environ.setdefault(name, value)
+The migration is run through the ``alembic`` console script (rather than
+importing alembic in-process) because the project's local ``alembic/`` migration
+directory would otherwise shadow the installed ``alembic`` package.
+"""
+import shutil
+import subprocess
+from pathlib import Path
 
-from packages.metadata import models  # noqa: E402,F401
-from packages.metadata.database import Base, engine  # noqa: E402
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def main() -> None:
-    Base.metadata.create_all(bind=engine)
-    print("Database schema initialized.")
+    alembic_bin = shutil.which("alembic")
+    if alembic_bin is None:
+        raise SystemExit(
+            "The 'alembic' executable was not found. "
+            "Install dependencies first: pip install -r requirements.txt"
+        )
+
+    subprocess.run(
+        [alembic_bin, "upgrade", "head"],
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
+    print("Database schema initialized (alembic upgrade head).")
 
 
 if __name__ == "__main__":

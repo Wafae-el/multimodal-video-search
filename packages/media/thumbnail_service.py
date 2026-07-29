@@ -36,8 +36,10 @@ def generate_thumbnail(
     try:
         subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=FFMPEG_TIMEOUT,
             check=True,
         )
@@ -47,14 +49,20 @@ def generate_thumbnail(
             "THUMBNAIL_TIMEOUT"
         )
 
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()[-500:]
         raise ThumbnailGenerationError(
-            "THUMBNAIL_GENERATION_FAILED"
+            f"THUMBNAIL_GENERATION_FAILED: {stderr}"
         )
 
     if not thumbnail_path.exists():
         raise ThumbnailGenerationError(
             "THUMBNAIL_NOT_CREATED"
+        )
+
+    if thumbnail_path.stat().st_size == 0:
+        raise ThumbnailGenerationError(
+            "THUMBNAIL_EMPTY"
         )
 
     return thumbnail_path

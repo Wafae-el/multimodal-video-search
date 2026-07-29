@@ -6,7 +6,7 @@ from alembic import context
 
 from packages.config.settings import settings
 from packages.metadata.database import Base
-from packages.metadata import models
+from packages.metadata import models  # noqa: F401  (registers models on Base.metadata)
 
 config = context.config
 

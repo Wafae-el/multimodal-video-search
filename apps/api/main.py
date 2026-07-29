@@ -1,16 +1,10 @@
 import hashlib
-import shutil
+import logging
 import uuid
 from pathlib import Path
 
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    Depends,
-    HTTPException,
-    status,
-)
+from fastapi import FastAPI, UploadFile, File, Depends, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from temporalio.client import Client
@@ -18,23 +12,25 @@ from temporalio.client import Client
 from packages.config.settings import settings
 from packages.metadata.database import get_db
 from packages.metadata.crud import (
-    create_asset,
-    register_original_media,
+    create_pending_asset,
+    mark_asset_failed,
+    finalize_original_upload,
+    set_asset_error,
     get_asset_status,
+    get_processing_steps,
 )
-from packages.media.ffprobe_service import (
-    analyze_video,
-    MediaValidationError,
-)
+from packages.media.ffprobe_service import analyze_video, MediaValidationError
 from packages.storage.minio_service import (
+    build_original_object_key,
     upload_original_video,
+    delete_object,
     create_bucket,
 )
-from packages.workflow.workflows import (
-    ProcessAssetWorkflow,
-    WorkflowInput,
-)
-from packages.workflow.state_machine import ProcessingState  # <-- Import ajouté
+from packages.workflow.workflows import ProcessAssetWorkflow
+from packages.workflow.contracts import ProcessAssetInput
+from packages.workflow.state_machine import ProcessingState
+
+logger = logging.getLogger("api.upload")
 
 app = FastAPI(
     title="Multimodal Video Search API",
@@ -44,175 +40,283 @@ app = FastAPI(
 TEMP_DIR = Path("temp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------- Modèles ----------
+CHUNK_SIZE = 1024 * 1024
+
+
+# ---------- Response models ----------
 class UploadResponse(BaseModel):
     asset_id: str
     workflow_id: str
     status: str
 
+
 class ErrorResponse(BaseModel):
     error: str
     code: str
+    # Present when a durable asset record was created (invalid / no-audio media),
+    # so the client can poll GET /v1/assets/{asset_id}.
+    asset_id: str | None = None
+
+
+class StepStatus(BaseModel):
+    step_name: str
+    state: str
+    attempts: int
+
 
 class AssetStatusResponse(BaseModel):
     asset_id: str
     status: str
     progress: int
+    # Asset-level attempts = the maximum attempt count across processing steps
+    # (1 on a clean run; increases when any step is retried).
     attempts: int
     last_error: str | None = None
+    steps: list[StepStatus] = []
 
-# ---------- Constantes ----------
-# Utilisation de la liste définie dans settings
-ALLOWED_TYPES = {
-    t.strip()
-    for t in settings.ALLOWED_CONTENT_TYPES.split(",")
-}
+
+# ---------- Structured error handling ----------
+class APIError(Exception):
+    """Carries a stable error code, HTTP status and safe message. Raw internal
+    exception strings are never propagated to the client."""
+
+    def __init__(self, status_code: int, code: str, message: str, asset_id: str | None = None):
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.asset_id = asset_id
+        super().__init__(message)
+
+
+@app.exception_handler(APIError)
+async def api_error_handler(request: Request, exc: APIError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            error=exc.message,
+            code=exc.code,
+            asset_id=exc.asset_id,
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    # Log the real cause server-side; return a stable, non-leaking body.
+    logger.exception("Unhandled error on %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(error="Internal server error", code="INTERNAL_ERROR").model_dump(),
+    )
+
+
+# ---------- Validation configuration ----------
+ALLOWED_TYPES = {t.strip() for t in settings.ALLOWED_CONTENT_TYPES.split(",") if t.strip()}
+ALLOWED_EXTENSIONS = {e.strip().lower() for e in settings.ALLOWED_EXTENSIONS.split(",") if e.strip()}
 MAX_SIZE = settings.MAX_UPLOAD_SIZE
+MAX_DURATION = settings.MAX_DURATION_SECONDS
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(8192):
-            digest.update(chunk)
-    return digest.hexdigest()
+# Maps ffprobe service codes -> (stable API code, HTTP status).
+MEDIA_ERROR_MAP = {
+    "CORRUPT_MEDIA": ("MEDIA_CORRUPT", 400),
+    "UNSUPPORTED_MEDIA": ("MEDIA_UNSUPPORTED", 415),
+    "MISSING_VIDEO_STREAM": ("MEDIA_NO_VIDEO_STREAM", 422),
+    "FFPROBE_TIMEOUT": ("FFPROBE_TIMEOUT", 503),
+    "FFPROBE_UNAVAILABLE": ("FFPROBE_UNAVAILABLE", 503),
+}
 
-# ---------- Événements ----------
+
+def sanitize_filename(raw: str | None) -> str:
+    """Return a display-safe base name. The filename is never used as identity."""
+    if not raw:
+        return "upload"
+    return Path(raw).name or "upload"
+
+
+def extract_extension(filename: str) -> str:
+    return Path(filename).suffix.lower().lstrip(".")
+
+
+# ---------- Lifecycle ----------
 @app.on_event("startup")
 async def startup():
     create_bucket()
+
 
 # ---------- Routes ----------
 @app.get("/")
 def root():
     return {"status": "running"}
 
+
 @app.post(
     "/v1/upload",
     response_model=UploadResponse,
+    status_code=202,
     responses={
         400: {"model": ErrorResponse},
         413: {"model": ErrorResponse},
         415: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
     },
 )
 async def upload_video(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
+    # 1. Identity is generated before any external write; the filename is never
+    #    used as durable identity.
     asset_id = str(uuid.uuid4())
+    pipeline_version = settings.PIPELINE_VERSION
+    safe_name = sanitize_filename(file.filename)
+    extension = extract_extension(safe_name)
 
-    # Vérification du type MIME
+    # 2. Request-level validation (MIME + extension) before we persist anything.
     if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail={
-                "code": "UNSUPPORTED_MEDIA_TYPE",
-                "error": "Unsupported media type",
-            },
-        )
+        raise APIError(415, "MEDIA_UNSUPPORTED", "Unsupported media type")
+    if extension not in ALLOWED_EXTENSIONS:
+        raise APIError(415, "MEDIA_UNSUPPORTED", "Unsupported file extension")
 
-    safe_name = Path(file.filename).name
     temp_file = TEMP_DIR / f"{asset_id}.upload"
 
     try:
-        # Sauvegarde temporaire
+        # 3. Stream to disk, computing the checksum and size in one pass and
+        #    enforcing the size limit while streaming.
+        digest = hashlib.sha256()
+        size = 0
         with open(temp_file, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while chunk := await file.read(CHUNK_SIZE):
+                size += len(chunk)
+                if size > MAX_SIZE:
+                    raise APIError(413, "MEDIA_TOO_LARGE", "Upload exceeds maximum size")
+                digest.update(chunk)
+                buffer.write(chunk)
+        checksum = digest.hexdigest()
 
-        file_size = temp_file.stat().st_size
-        if file_size > MAX_SIZE:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail={
-                    "code": "FILE_TOO_LARGE",
-                    "error": "Upload exceeds maximum size",
-                },
-            )
-
-        checksum = sha256_file(temp_file)
-
-        # Analyse avec ffprobe
-        try:
-            metadata = analyze_video(temp_file)
-        except MediaValidationError as exc:
-            code_map = {
-                "CORRUPT_MEDIA": status.HTTP_400_BAD_REQUEST,
-                "UNSUPPORTED_MEDIA": status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                "MISSING_VIDEO_STREAM": status.HTTP_400_BAD_REQUEST,
-                "FFPROBE_TIMEOUT": status.HTTP_500_INTERNAL_SERVER_ERROR,
-                "FFPROBE_UNAVAILABLE": status.HTTP_500_INTERNAL_SERVER_ERROR,
-            }
-            raise HTTPException(
-                status_code=code_map.get(exc.code, status.HTTP_400_BAD_REQUEST),
-                detail={"code": exc.code, "error": exc.code},
-            )
-
-        if not metadata.has_audio:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": "NO_AUDIO",
-                    "error": "Video has no audio stream",
-                },
-            )
-
-        # Upload vers MinIO
-        upload = upload_original_video(asset_id, temp_file)
-
-        # Création de l'asset en base
-        asset = create_asset(
+        # 4. Create the durable validation record BEFORE completing validation,
+        #    so invalid / no-audio outcomes remain observable via GET.
+        create_pending_asset(
             db=db,
             asset_id=asset_id,
             filename=safe_name,
             content_type=file.content_type,
-            duration=metadata.duration,
-            duration_ms=int(metadata.duration * 1000),
-            codec=metadata.video_codec,
-            width=metadata.width,
-            height=metadata.height,
-            size=file_size,
             source_checksum=checksum,
-            pipeline_version=settings.PIPELINE_VERSION,
-            minio_bucket=upload["bucket"],
-            minio_object_key=upload["object_key"],
-            status=ProcessingState.UPLOADED.value,   # <-- Utilisation de l'enum
-            progress=0,
+            size=size,
+            pipeline_version=pipeline_version,
+            status=ProcessingState.VALIDATING.value,
         )
 
-        # Enregistrement du média original
-        register_original_media(
-            db=db,
-            video_id=asset.id,
-            bucket=upload["bucket"],
-            object_key=upload["object_key"],
-            checksum=checksum,
-        )
+        # 5. Media validation via ffprobe. Failures are persisted as FAILED.
+        try:
+            metadata = analyze_video(temp_file)
+        except MediaValidationError as exc:
+            api_code, http_status = MEDIA_ERROR_MAP.get(
+                exc.code, ("MEDIA_CORRUPT", 400)
+            )
+            mark_asset_failed(
+                db, asset_id,
+                status=ProcessingState.FAILED.value,
+                error_code=api_code,
+                progress=0,
+            )
+            raise APIError(http_status, api_code, "Media validation failed", asset_id=asset_id)
 
-        # Connexion à Temporal et démarrage du workflow
-        client = await Client.connect(settings.TEMPORAL_ADDRESS)
-        workflow_id = f"asset-{asset.asset_id}"
-        await client.start_workflow(
-            ProcessAssetWorkflow.run,
-            WorkflowInput(
-                asset_id=asset.asset_id,
-                pipeline_version=asset.pipeline_version,
-            ),
-            id=workflow_id,
-            task_queue=settings.TEMPORAL_TASK_QUEUE,
-        )
+        # 6. Optional duration limit.
+        if MAX_DURATION is not None and metadata.duration > MAX_DURATION:
+            mark_asset_failed(
+                db, asset_id,
+                status=ProcessingState.FAILED.value,
+                error_code="MEDIA_DURATION_EXCEEDED",
+                progress=0,
+            )
+            raise APIError(422, "MEDIA_DURATION_EXCEEDED", "Media duration exceeds limit", asset_id=asset_id)
 
-        # Mise à jour du workflow_id dans l'asset
-        asset.workflow_id = workflow_id
-        db.commit()
+        # 7. Valid video without audio: persist NO_AUDIO explicitly and stop.
+        #    NO_AUDIO is a terminal Week 1 state (no workflow is started).
+        if not metadata.has_audio:
+            mark_asset_failed(
+                db, asset_id,
+                status=ProcessingState.NO_AUDIO.value,
+                error_code="MEDIA_NO_AUDIO",
+                progress=0,
+            )
+            raise APIError(422, "MEDIA_NO_AUDIO", "Video has no audio stream", asset_id=asset_id)
+
+        # 8. Store the original at a deterministic key. A per-asset key means a
+        #    retry for a different asset can never overwrite another asset.
+        object_key = build_original_object_key(asset_id, extension or "mp4")
+        try:
+            upload = upload_original_video(asset_id, temp_file, extension or "mp4")
+        except Exception:
+            logger.exception("MinIO upload failed for asset %s", asset_id)
+            mark_asset_failed(
+                db, asset_id,
+                status=ProcessingState.FAILED.value,
+                error_code="STORAGE_ERROR",
+                progress=0,
+            )
+            raise APIError(503, "STORAGE_ERROR", "Failed to store media", asset_id=asset_id)
+
+        # 9. Deterministic workflow id, persisted atomically with the media_file
+        #    row (asset update + media_file insert in one transaction). If this
+        #    fails after the object is stored, delete the object (no orphans).
+        workflow_id = f"process-asset-{asset_id}-{pipeline_version}"
+        try:
+            finalize_original_upload(
+                db, asset_id,
+                bucket=upload["bucket"],
+                object_key=object_key,
+                duration=metadata.duration,
+                duration_ms=int(metadata.duration * 1000),
+                codec=metadata.video_codec,
+                width=metadata.width,
+                height=metadata.height,
+                workflow_id=workflow_id,
+                status=ProcessingState.UPLOADED.value,
+            )
+        except Exception:
+            logger.exception("DB finalize failed for asset %s; rolling back object", asset_id)
+            try:
+                delete_object(object_key)
+            except Exception:
+                logger.exception("Failed to delete orphaned object %s", object_key)
+            mark_asset_failed(
+                db, asset_id,
+                status=ProcessingState.FAILED.value,
+                error_code="DB_PERSIST_FAILED",
+                progress=0,
+            )
+            raise APIError(500, "DB_PERSIST_FAILED", "Failed to persist media record", asset_id=asset_id)
+
+        # 10. Dispatch the durable workflow. The workflow id is already persisted,
+        #     so if dispatch fails the asset stays in a recoverable UPLOADED state
+        #     with last_error set, and a retry can safely re-dispatch the same id.
+        try:
+            client = await Client.connect(settings.TEMPORAL_ADDRESS)
+            await client.start_workflow(
+                ProcessAssetWorkflow.run,
+                ProcessAssetInput(asset_id=asset_id, pipeline_version=pipeline_version),
+                id=workflow_id,
+                task_queue=settings.TEMPORAL_TASK_QUEUE,
+            )
+        except Exception:
+            logger.exception("Workflow dispatch failed for asset %s", asset_id)
+            set_asset_error(db, asset_id, error_code="WORKFLOW_DISPATCH_FAILED")
+            raise APIError(
+                500, "WORKFLOW_DISPATCH_FAILED",
+                "Media stored but processing could not be started; retry is safe",
+                asset_id=asset_id,
+            )
 
         return UploadResponse(
-            asset_id=asset.asset_id,
+            asset_id=asset_id,
             workflow_id=workflow_id,
-            status="UPLOADED",
+            status=ProcessingState.UPLOADED.value,
         )
 
     finally:
-        # Nettoyage du fichier temporaire
         if temp_file.exists():
             temp_file.unlink()
 
@@ -228,17 +332,16 @@ def asset_status(
 ):
     asset = get_asset_status(db, asset_id)
     if asset is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": "ASSET_NOT_FOUND",
-                "error": "Asset not found",
-            },
-        )
+        raise APIError(404, "ASSET_NOT_FOUND", "Asset not found")
+    steps = [
+        StepStatus(step_name=s.step_name, state=s.state, attempts=s.attempts or 0)
+        for s in get_processing_steps(db, asset_id)
+    ]
     return AssetStatusResponse(
         asset_id=asset.asset_id,
         status=asset.status,
         progress=asset.progress,
-        attempts=asset.attempts,
+        attempts=asset.attempts or 0,
         last_error=asset.last_error,
+        steps=steps,
     )

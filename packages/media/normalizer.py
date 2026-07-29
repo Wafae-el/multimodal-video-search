@@ -41,8 +41,10 @@ def normalize_video(
     try:
         subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=FFMPEG_TIMEOUT,
             check=True,
         )
@@ -51,9 +53,10 @@ def normalize_video(
             "VIDEO_NORMALIZATION_TIMEOUT"
         )
 
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()[-500:]
         raise VideoNormalizationError(
-            "VIDEO_NORMALIZATION_FAILED"
+            f"VIDEO_NORMALIZATION_FAILED: {stderr}"
         )
 
     if not output_path.exists():
