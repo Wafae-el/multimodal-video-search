@@ -15,6 +15,10 @@ with workflow.unsafe.imports_passed_through():
         normalize_video,
         extract_audio,
         generate_thumbnail,
+        segment_media,
+        index_speech,
+        index_visual,
+        score_audio_quality,
     )
 
 # Explicit retry policy: bounded attempts, exponential backoff, and media
@@ -41,26 +45,58 @@ class ProcessAssetWorkflow:
         heartbeat = timedelta(seconds=10)
         try:
             await workflow.execute_activity(
-                probe_video, request,
+                probe_video,
+                request,
                 start_to_close_timeout=timedelta(minutes=2),
                 heartbeat_timeout=heartbeat,
                 retry_policy=ACTIVITY_RETRY,
             )
             await workflow.execute_activity(
-                normalize_video, request,
+                normalize_video,
+                request,
                 start_to_close_timeout=timedelta(minutes=20),
                 heartbeat_timeout=heartbeat,
                 retry_policy=ACTIVITY_RETRY,
             )
             await workflow.execute_activity(
-                extract_audio, request,
+                extract_audio,
+                request,
                 start_to_close_timeout=timedelta(minutes=10),
                 heartbeat_timeout=heartbeat,
                 retry_policy=ACTIVITY_RETRY,
             )
             await workflow.execute_activity(
-                generate_thumbnail, request,
+                generate_thumbnail,
+                request,
                 start_to_close_timeout=timedelta(minutes=5),
+                heartbeat_timeout=heartbeat,
+                retry_policy=ACTIVITY_RETRY,
+            )
+            await workflow.execute_activity(
+                segment_media,
+                request,
+                start_to_close_timeout=timedelta(minutes=2),
+                heartbeat_timeout=heartbeat,
+                retry_policy=ACTIVITY_RETRY,
+            )
+            await workflow.execute_activity(
+                index_speech,
+                request,
+                start_to_close_timeout=timedelta(minutes=2),
+                heartbeat_timeout=heartbeat,
+                retry_policy=ACTIVITY_RETRY,
+            )
+            await workflow.execute_activity(
+                index_visual,
+                request,
+                start_to_close_timeout=timedelta(minutes=2),
+                heartbeat_timeout=heartbeat,
+                retry_policy=ACTIVITY_RETRY,
+            )
+            await workflow.execute_activity(
+                score_audio_quality,
+                request,
+                start_to_close_timeout=timedelta(minutes=2),
                 heartbeat_timeout=heartbeat,
                 retry_policy=ACTIVITY_RETRY,
             )

@@ -9,10 +9,7 @@ def test_random_sequences():
 
         assert artifacts <= 1
 
-        assert (
-            (state == ProcessingState.DONE and artifacts == 1)
-            or state == ProcessingState.FAILED
-        )
+        assert (state == ProcessingState.DONE and artifacts == 1) or state == ProcessingState.FAILED
 
 
 def test_many_random_sequences():
@@ -21,7 +18,4 @@ def test_many_random_sequences():
 
         assert artifacts <= 1
 
-        assert (
-            (state == ProcessingState.DONE and artifacts == 1)
-            or state == ProcessingState.FAILED
-        )
+        assert (state == ProcessingState.DONE and artifacts == 1) or state == ProcessingState.FAILED

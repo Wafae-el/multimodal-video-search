@@ -32,6 +32,10 @@ def build_thumbnail_object_key(asset_id: str) -> str:
     return f"media-derived/{asset_id}/thumbnail/default.jpg"
 
 
+def build_manifest_object_key(asset_id: str, name: str) -> str:
+    return f"media-derived/{asset_id}/manifests/{name}.json"
+
+
 def object_exists(object_key: str) -> bool:
     """Return True if the object is present. Used to verify a stored artifact
     before marking a step complete, and to confirm a previously completed
@@ -135,6 +139,26 @@ def get_object(object_key: str):
         settings.MINIO_BUCKET,
         object_key,
     )
+
+
+def upload_json_manifest(asset_id: str, name: str, file_path: Path):
+    object_key = build_manifest_object_key(asset_id, name)
+
+    result = client.fput_object(
+        settings.MINIO_BUCKET,
+        object_key,
+        str(file_path),
+        content_type="application/json",
+    )
+
+    return {
+        "bucket": settings.MINIO_BUCKET,
+        "object_key": object_key,
+        "etag": result.etag,
+        "size": file_path.stat().st_size,
+    }
+
+
 def upload_normalized_video(
     asset_id: str,
     file_path: Path,

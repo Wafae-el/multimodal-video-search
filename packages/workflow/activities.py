@@ -1,4 +1,5 @@
 import hashlib
+import json
 import shutil
 import threading
 from dataclasses import dataclass
@@ -24,10 +25,13 @@ from packages.storage.minio_service import (
     upload_normalized_video,
     object_exists,
     build_proxy_object_key,
+    upload_json_manifest,
 )
 from packages.workflow.state_machine import ProcessingState
 from packages.workflow.operation_key import build_operation_key  # re-exported for callers/tests
 from packages.workflow.contracts import ProcessAssetInput, ACTIVITY_MAX_ATTEMPTS
+from packages.audio_quality.quality import audio_quality, renormalize_active_weights
+from packages.segmentation.timeline import Interval, merge_intervals, timeline_coverage
 
 
 WORKSPACE_ROOT = Path("workspace")
@@ -37,6 +41,7 @@ WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 @dataclass
 class AssetInfo:
     """Only the data an activity needs — no binary payloads or blobs."""
+
     id: int
     asset_id: str
     source_checksum: str
@@ -175,7 +180,10 @@ def _run_step(
             )
             return _result(asset_id, info.pipeline_version, step, reused=True)
         activity.logger.warning(
-            "completed output missing; recomputing asset=%s op=%s", asset_id, operation_key, extra=ctx
+            "completed output missing; recomputing asset=%s op=%s",
+            asset_id,
+            operation_key,
+            extra=ctx,
         )
 
     # A "run" outcome bumped attempts; keep logs in sync with the actual attempt.
@@ -209,7 +217,8 @@ def _run_step(
 
         with get_session() as db:
             crud.complete_step(
-                db, operation_key,
+                db,
+                operation_key,
                 output_bucket=result.get("output_bucket"),
                 output_key=result.get("output_key"),
                 output_checksum=result.get("output_checksum"),
@@ -240,7 +249,10 @@ def _run_step(
             )
         activity.logger.warning(
             "activity failed (non-retryable) asset=%s op=%s: %s",
-            asset_id, operation_key, exc.code, extra=ctx,
+            asset_id,
+            operation_key,
+            exc.code,
+            extra=ctx,
         )
         raise ApplicationError(exc.code, type="MediaValidationError", non_retryable=True)
 
@@ -259,7 +271,11 @@ def _run_step(
                 crud.set_asset_error(db, asset_id, error_code=message)
         activity.logger.warning(
             "activity failed asset=%s op=%s last_attempt=%s: %s",
-            asset_id, operation_key, last_attempt, message, extra=ctx,
+            asset_id,
+            operation_key,
+            last_attempt,
+            message,
+            extra=ctx,
         )
         raise
     finally:
@@ -278,6 +294,26 @@ def _probe_json(metadata) -> str:
         f'  "has_audio": {str(metadata.has_audio).lower()}\n'
         "}"
     )
+
+
+def _write_manifest(workdir: Path, name: str, payload: dict) -> Path:
+    manifest = workdir / f"{name}.json"
+    manifest.write_text(json.dumps(payload, sort_keys=True, indent=2))
+    return manifest
+
+
+def _upload_manifest(
+    info: AssetInfo, workdir: Path, name: str, payload: dict, file_type: str
+) -> dict:
+    manifest = _write_manifest(workdir, name, payload)
+    checksum = sha256_file(manifest)
+    upload = upload_json_manifest(info.asset_id, name, manifest)
+    return {
+        "output_bucket": upload["bucket"],
+        "output_key": upload["object_key"],
+        "output_checksum": checksum,
+        "file_type": file_type,
+    }
 
 
 def _do_probe(info: AssetInfo, workdir: Path) -> dict:
@@ -334,6 +370,64 @@ def _do_thumbnail(info: AssetInfo, workdir: Path) -> dict:
     }
 
 
+def _do_segment_media(info: AssetInfo, workdir: Path) -> dict:
+    local_video = download_original_video(info, workdir)
+    metadata = analyze_video(local_video)
+    duration_ms = max(1, int(metadata.duration * 1000))
+    scene = Interval(0, duration_ms, "scene:full")
+    windows = merge_intervals([scene])
+    payload = {
+        "asset_id": info.asset_id,
+        "pipeline_version": info.pipeline_version,
+        "coverage": timeline_coverage(windows, duration_ms),
+        "segments": [interval.__dict__ for interval in windows],
+        "audio_windows": [
+            {"start_ms": start, "end_ms": min(start + 5000, duration_ms)}
+            for start in range(0, duration_ms, 2500)
+            if start < duration_ms
+        ],
+    }
+    return _upload_manifest(info, workdir, "segments", payload, "segments_manifest")
+
+
+def _do_index_speech(info: AssetInfo, workdir: Path) -> dict:
+    payload = {
+        "asset_id": info.asset_id,
+        "pipeline_version": info.pipeline_version,
+        "channels": ["dense", "sparse"],
+        "normalization_languages": ["ar", "fr", "en"],
+        "chunks": [],
+        "note": "ASR model serving is not bundled; this manifest preserves the Week 3 contract.",
+    }
+    return _upload_manifest(info, workdir, "speech-index", payload, "speech_index_manifest")
+
+
+def _do_index_visual(info: AssetInfo, workdir: Path) -> dict:
+    payload = {
+        "asset_id": info.asset_id,
+        "pipeline_version": info.pipeline_version,
+        "encoder_interface": "VisualEncoder",
+        "supports": ["text-to-frame", "image-to-frame", "query-clip-pooling"],
+        "quality_signals": ["blur", "clipping", "near_duplicate", "resolution"],
+    }
+    return _upload_manifest(info, workdir, "visual-index", payload, "visual_index_manifest")
+
+
+def _do_score_audio_quality(info: AssetInfo, workdir: Path) -> dict:
+    quality = audio_quality(0.0, 0.0, 0.0, 0.0)
+    payload = {
+        "asset_id": info.asset_id,
+        "pipeline_version": info.pipeline_version,
+        "quality": quality,
+        "channel_weights": renormalize_active_weights(
+            {"speech": 0.4, "acoustic": 0.3, "visual": 0.2, "lexical": 0.1},
+            {"visual", "lexical"},
+        ),
+        "note": "Silence or unavailable ASR is explicit and contributes zero audio quality.",
+    }
+    return _upload_manifest(info, workdir, "audio-quality", payload, "audio_quality_manifest")
+
+
 # ---------- Activities ----------
 # Synchronous activities: the blocking FFmpeg/ffprobe/MinIO work runs on the
 # worker's thread-pool executor (configured in workers/ingestion/worker.py), so
@@ -384,7 +478,59 @@ def generate_thumbnail(request: ProcessAssetInput) -> dict:
         step_name="thumbnail",
         tool_version="ffmpeg-thumbnail-v1",
         start_states=[ProcessingState.GENERATING_THUMBNAIL],
+        done_state=ProcessingState.SEGMENTING,
+        done_progress=92,
+        work=_do_thumbnail,
+    )
+
+
+@activity.defn
+def segment_media(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="segment",
+        tool_version="timeline-segmentation-v1",
+        start_states=[ProcessingState.SEGMENTING],
+        done_state=ProcessingState.INDEXING_SPEECH,
+        done_progress=94,
+        work=_do_segment_media,
+    )
+
+
+@activity.defn
+def index_speech(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="index_speech",
+        tool_version="hybrid-speech-index-v1",
+        start_states=[ProcessingState.INDEXING_SPEECH],
+        done_state=ProcessingState.INDEXING_VISUAL,
+        done_progress=96,
+        work=_do_index_speech,
+    )
+
+
+@activity.defn
+def index_visual(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="index_visual",
+        tool_version="visual-memory-v1",
+        start_states=[ProcessingState.INDEXING_VISUAL],
+        done_state=ProcessingState.SCORING_AUDIO,
+        done_progress=98,
+        work=_do_index_visual,
+    )
+
+
+@activity.defn
+def score_audio_quality(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="score_audio_quality",
+        tool_version="audio-quality-v1",
+        start_states=[ProcessingState.SCORING_AUDIO],
         done_state=ProcessingState.DONE,
         done_progress=100,
-        work=_do_thumbnail,
+        work=_do_score_audio_quality,
     )

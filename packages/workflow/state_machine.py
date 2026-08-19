@@ -8,6 +8,10 @@ class ProcessingState(str, Enum):
     NORMALIZING = "NORMALIZING"
     EXTRACTING_AUDIO = "EXTRACTING_AUDIO"
     GENERATING_THUMBNAIL = "GENERATING_THUMBNAIL"
+    SEGMENTING = "SEGMENTING"
+    INDEXING_SPEECH = "INDEXING_SPEECH"
+    INDEXING_VISUAL = "INDEXING_VISUAL"
+    SCORING_AUDIO = "SCORING_AUDIO"
     DONE = "DONE"
     FAILED = "FAILED"
     NO_AUDIO = "NO_AUDIO"
@@ -21,6 +25,10 @@ class ProcessingEvent(str, Enum):
     NORMALIZE_OK = "NORMALIZE_OK"
     AUDIO_OK = "AUDIO_OK"
     THUMBNAIL_OK = "THUMBNAIL_OK"
+    SEGMENT_OK = "SEGMENT_OK"
+    SPEECH_INDEX_OK = "SPEECH_INDEX_OK"
+    VISUAL_INDEX_OK = "VISUAL_INDEX_OK"
+    AUDIO_SCORE_OK = "AUDIO_SCORE_OK"
 
     # Événements spéciaux / reprises
     RETRY = "RETRY"
@@ -35,39 +43,41 @@ class ProcessingEvent(str, Enum):
 def next_state(state: ProcessingState, event: ProcessingEvent) -> ProcessingState:
     transitions = {
         # Parcours nominal
-        (ProcessingState.UPLOADED, ProcessingEvent.UPLOAD_COMPLETE):
-            ProcessingState.VALIDATING,
-
-        (ProcessingState.VALIDATING, ProcessingEvent.VALIDATION_OK):
-            ProcessingState.PROBING,
-
-        (ProcessingState.PROBING, ProcessingEvent.PROBE_OK):
+        (ProcessingState.UPLOADED, ProcessingEvent.UPLOAD_COMPLETE): ProcessingState.VALIDATING,
+        (ProcessingState.VALIDATING, ProcessingEvent.VALIDATION_OK): ProcessingState.PROBING,
+        (ProcessingState.PROBING, ProcessingEvent.PROBE_OK): ProcessingState.NORMALIZING,
+        (
             ProcessingState.NORMALIZING,
-
-        (ProcessingState.NORMALIZING, ProcessingEvent.NORMALIZE_OK):
+            ProcessingEvent.NORMALIZE_OK,
+        ): ProcessingState.EXTRACTING_AUDIO,
+        (
             ProcessingState.EXTRACTING_AUDIO,
-
-        (ProcessingState.EXTRACTING_AUDIO, ProcessingEvent.AUDIO_OK):
+            ProcessingEvent.AUDIO_OK,
+        ): ProcessingState.GENERATING_THUMBNAIL,
+        (
             ProcessingState.GENERATING_THUMBNAIL,
-
-        (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.THUMBNAIL_OK):
-            ProcessingState.DONE,
-
+            ProcessingEvent.THUMBNAIL_OK,
+        ): ProcessingState.SEGMENTING,
+        (ProcessingState.SEGMENTING, ProcessingEvent.SEGMENT_OK): ProcessingState.INDEXING_SPEECH,
+        (
+            ProcessingState.INDEXING_SPEECH,
+            ProcessingEvent.SPEECH_INDEX_OK,
+        ): ProcessingState.INDEXING_VISUAL,
+        (
+            ProcessingState.INDEXING_VISUAL,
+            ProcessingEvent.VISUAL_INDEX_OK,
+        ): ProcessingState.SCORING_AUDIO,
+        (ProcessingState.SCORING_AUDIO, ProcessingEvent.AUDIO_SCORE_OK): ProcessingState.DONE,
         # Gestion des erreurs spécifiques
-        (ProcessingState.VALIDATING, ProcessingEvent.NO_AUDIO):
-            ProcessingState.NO_AUDIO,
-
-        (ProcessingState.PROBING, ProcessingEvent.ERROR):
-            ProcessingState.FAILED,
-
-        (ProcessingState.NORMALIZING, ProcessingEvent.ERROR):
-            ProcessingState.FAILED,
-
-        (ProcessingState.EXTRACTING_AUDIO, ProcessingEvent.ERROR):
-            ProcessingState.FAILED,
-
-        (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.ERROR):
-            ProcessingState.FAILED,
+        (ProcessingState.VALIDATING, ProcessingEvent.NO_AUDIO): ProcessingState.NO_AUDIO,
+        (ProcessingState.PROBING, ProcessingEvent.ERROR): ProcessingState.FAILED,
+        (ProcessingState.NORMALIZING, ProcessingEvent.ERROR): ProcessingState.FAILED,
+        (ProcessingState.EXTRACTING_AUDIO, ProcessingEvent.ERROR): ProcessingState.FAILED,
+        (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.ERROR): ProcessingState.FAILED,
+        (ProcessingState.SEGMENTING, ProcessingEvent.ERROR): ProcessingState.FAILED,
+        (ProcessingState.INDEXING_SPEECH, ProcessingEvent.ERROR): ProcessingState.FAILED,
+        (ProcessingState.INDEXING_VISUAL, ProcessingEvent.ERROR): ProcessingState.FAILED,
+        (ProcessingState.SCORING_AUDIO, ProcessingEvent.ERROR): ProcessingState.FAILED,
     }
 
     # Lève une exception explicite si la transition est invalide
@@ -94,6 +104,10 @@ STATE_ORDER = [
     ProcessingState.NORMALIZING,
     ProcessingState.EXTRACTING_AUDIO,
     ProcessingState.GENERATING_THUMBNAIL,
+    ProcessingState.SEGMENTING,
+    ProcessingState.INDEXING_SPEECH,
+    ProcessingState.INDEXING_VISUAL,
+    ProcessingState.SCORING_AUDIO,
     ProcessingState.DONE,
 ]
 STATE_RANK = {state: index for index, state in enumerate(STATE_ORDER)}

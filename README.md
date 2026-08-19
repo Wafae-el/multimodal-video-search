@@ -5,14 +5,16 @@
 Multimodal Video Search is a backend platform for ingesting and processing
 videos in preparation for multimodal retrieval.
 
-This repository contains the **Week 1 ingestion foundation**: a durable,
-idempotent processing pipeline that validates an uploaded video, persists its
-metadata, stores it in object storage, and runs a Temporal workflow that
-normalizes the video and produces derived artifacts (a 720p proxy, extracted
-audio, and a thumbnail). Retrieval, embeddings, scene detection, ASR, and search
-are **not** part of Week 1 and are not implemented.
+This repository contains the **Week 1 ingestion foundation** plus tested
+Weeks 2–5 research-quest primitives. Week 1 provides a durable, idempotent
+processing pipeline that validates an uploaded video, persists its metadata,
+stores it in object storage, and runs a Temporal workflow that normalizes the
+video and produces derived artifacts (a 720p proxy, extracted audio, and a
+thumbnail). Weeks 2–5 add self-contained utilities for timeline segmentation,
+hybrid text retrieval, visual frame matching, and audio quality control; these
+are ready to wire into the production pipeline.
 
-## Week 1 Scope
+## Implemented Scope
 
 Implemented:
 
@@ -26,10 +28,16 @@ Implemented:
 - Worker-restart recovery and duplicate-delivery protection
 - Explicit, durable invalid-media and no-audio states
 - Docker Compose environment + Dockerfile for reproducible runs
+- Timeline interval utilities for Week 2 segmentation
+- Dense, sparse and fused retrieval scoring utilities for Week 3
+- Visual frame matching, clip pooling and duplicate suppression for Week 4
+- Audio quality scoring and active-channel renormalization for Week 5
+- Quality-weighted RRF, temporal aggregation, stable search contracts and evaluation metrics for Weeks 6–8
 - Unit, self-contained, and real-service integration tests, plus CI
 
-Explicitly **out of scope**: scene detection, frame segmentation, ASR,
-embeddings, retrieval, fusion, and UI.
+Still **out of scope**: full scene detection services, ASR model serving,
+embedding model serving, Qdrant indexing, search API endpoints, biometric
+identity enrollment, diarization, and UI.
 
 ## Architecture Overview
 
@@ -48,6 +56,8 @@ Client ──POST /v1/upload──▶ FastAPI (apps/api)
                  Worker (workers/ingestion, sync activities on a thread pool)
                  ProcessAssetWorkflow:
                    probe_video ─▶ normalize_video ─▶ extract_audio ─▶ generate_thumbnail
+                     ─▶ segment_media ─▶ index_speech ─▶ index_visual
+                     ─▶ score_audio_quality
 ```
 
 Each activity is idempotent and retry-safe: it derives a canonical
@@ -68,7 +78,10 @@ apps/api/              FastAPI application (upload + status endpoints)
 workers/ingestion/     Temporal worker (sync activities + thread pool)
 packages/config/       Typed settings (pydantic-settings)
 packages/media/        ffprobe validation, normalizer, thumbnail service
-packages/segmentation/ audio extraction
+packages/segmentation/ audio extraction + shared timestamp utilities
+packages/retrieval/    dense/sparse scoring and reciprocal-rank fusion
+packages/visual/       frame matching and duplicate suppression
+packages/audio_quality/ audio quality and channel weighting
 packages/storage/      MinIO client and helpers
 packages/metadata/     SQLAlchemy models, session, CRUD
 packages/workflow/     Temporal workflow, activities, state machine, operation key, contracts
@@ -171,6 +184,17 @@ Invalid media is persisted as `FAILED`, and valid video without audio as
 `NO_AUDIO` (a terminal Week 1 state — no workflow is started). Both are
 observable via `GET /v1/assets/{asset_id}`.
 
+## Search API Example
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/search \
+  -H "content-type: application/json" \
+  -d '{"text":"minister speaking outside","modalities":["transcript","visual"],"weights":{"transcript":0.4,"visual":0.4,"audio":0.2},"limit":20}'
+```
+
+The route validates the independent Week 7 contract, normalizes active weights,
+and returns stable diagnostics while retrieval backends are wired in.
+
 ## Asset-Status Example
 
 ```bash
@@ -194,7 +218,8 @@ curl http://127.0.0.1:8000/v1/assets/<asset_id>
 ```
 
 States: `UPLOADED → VALIDATING → PROBING → NORMALIZING → EXTRACTING_AUDIO →
-GENERATING_THUMBNAIL → DONE`, terminal `FAILED` and `NO_AUDIO`. `attempts` is the
+GENERATING_THUMBNAIL → SEGMENTING → INDEXING_SPEECH → INDEXING_VISUAL →
+SCORING_AUDIO → DONE`, terminal `FAILED` and `NO_AUDIO`. `attempts` is the
 maximum attempt count across steps (1 on a clean run, higher after a retry).
 
 ## Test Commands

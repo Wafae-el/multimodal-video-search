@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 from temporalio.client import Client
 
@@ -29,6 +29,7 @@ from packages.storage.minio_service import (
 from packages.workflow.workflows import ProcessAssetWorkflow
 from packages.workflow.contracts import ProcessAssetInput
 from packages.workflow.state_machine import ProcessingState
+from packages.audio_quality.quality import renormalize_active_weights
 
 logger = logging.getLogger("api.upload")
 
@@ -62,6 +63,67 @@ class StepStatus(BaseModel):
     step_name: str
     state: str
     attempts: int
+
+
+class QueryMediaRef(BaseModel):
+    media_id: str
+    media_type: str
+
+
+class SearchRequest(BaseModel):
+    text: str | None = None
+    query_media_ids: list[QueryMediaRef] = Field(default_factory=list)
+    modalities: list[str] = Field(default_factory=lambda: ["transcript", "visual", "audio"])
+    weights: dict[str, float] = Field(
+        default_factory=lambda: {"transcript": 0.4, "visual": 0.4, "audio": 0.2}
+    )
+    filters: dict[str, list[str] | str | int | float] = Field(default_factory=dict)
+    limit: int = Field(default=20, ge=1, le=100)
+
+    @field_validator("modalities")
+    @classmethod
+    def validate_modalities(cls, value: list[str]) -> list[str]:
+        allowed = {"transcript", "visual", "audio"}
+        unsupported = sorted(set(value) - allowed)
+        if unsupported:
+            raise ValueError(f"unsupported modalities: {unsupported}")
+        if not value:
+            raise ValueError("at least one modality is required")
+        return value
+
+    @model_validator(mode="after")
+    def validate_query_and_weights(self) -> "SearchRequest":
+        if not self.text and not self.query_media_ids:
+            raise ValueError("text or query_media_ids is required")
+        if any(weight < 0 for weight in self.weights.values()):
+            raise ValueError("weights must be non-negative")
+        renormalize_active_weights(self.weights, set(self.modalities))
+        return self
+
+
+class ChannelContribution(BaseModel):
+    modality: str
+    score: float
+
+
+class SearchResult(BaseModel):
+    asset_id: str
+    start_ms: int
+    end_ms: int
+    final_score: float
+    transcript: str | None = None
+    preview_url: str | None = None
+    channels: list[ChannelContribution] = Field(default_factory=list)
+    evidence: list[dict[str, str]] = Field(default_factory=list)
+
+
+class SearchResponse(BaseModel):
+    query_id: str
+    results: list[SearchResult]
+    diagnostics: dict[str, str | int | float | dict[str, float]] = Field(default_factory=dict)
+
+
+_SEARCH_CACHE: dict[str, SearchResponse] = {}
 
 
 class AssetStatusResponse(BaseModel):
@@ -112,7 +174,9 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 
 # ---------- Validation configuration ----------
 ALLOWED_TYPES = {t.strip() for t in settings.ALLOWED_CONTENT_TYPES.split(",") if t.strip()}
-ALLOWED_EXTENSIONS = {e.strip().lower() for e in settings.ALLOWED_EXTENSIONS.split(",") if e.strip()}
+ALLOWED_EXTENSIONS = {
+    e.strip().lower() for e in settings.ALLOWED_EXTENSIONS.split(",") if e.strip()
+}
 MAX_SIZE = settings.MAX_UPLOAD_SIZE
 MAX_DURATION = settings.MAX_DURATION_SECONDS
 
@@ -212,11 +276,10 @@ async def upload_video(
         try:
             metadata = analyze_video(temp_file)
         except MediaValidationError as exc:
-            api_code, http_status = MEDIA_ERROR_MAP.get(
-                exc.code, ("MEDIA_CORRUPT", 400)
-            )
+            api_code, http_status = MEDIA_ERROR_MAP.get(exc.code, ("MEDIA_CORRUPT", 400))
             mark_asset_failed(
-                db, asset_id,
+                db,
+                asset_id,
                 status=ProcessingState.FAILED.value,
                 error_code=api_code,
                 progress=0,
@@ -226,18 +289,22 @@ async def upload_video(
         # 6. Optional duration limit.
         if MAX_DURATION is not None and metadata.duration > MAX_DURATION:
             mark_asset_failed(
-                db, asset_id,
+                db,
+                asset_id,
                 status=ProcessingState.FAILED.value,
                 error_code="MEDIA_DURATION_EXCEEDED",
                 progress=0,
             )
-            raise APIError(422, "MEDIA_DURATION_EXCEEDED", "Media duration exceeds limit", asset_id=asset_id)
+            raise APIError(
+                422, "MEDIA_DURATION_EXCEEDED", "Media duration exceeds limit", asset_id=asset_id
+            )
 
         # 7. Valid video without audio: persist NO_AUDIO explicitly and stop.
         #    NO_AUDIO is a terminal Week 1 state (no workflow is started).
         if not metadata.has_audio:
             mark_asset_failed(
-                db, asset_id,
+                db,
+                asset_id,
                 status=ProcessingState.NO_AUDIO.value,
                 error_code="MEDIA_NO_AUDIO",
                 progress=0,
@@ -252,7 +319,8 @@ async def upload_video(
         except Exception:
             logger.exception("MinIO upload failed for asset %s", asset_id)
             mark_asset_failed(
-                db, asset_id,
+                db,
+                asset_id,
                 status=ProcessingState.FAILED.value,
                 error_code="STORAGE_ERROR",
                 progress=0,
@@ -265,7 +333,8 @@ async def upload_video(
         workflow_id = f"process-asset-{asset_id}-{pipeline_version}"
         try:
             finalize_original_upload(
-                db, asset_id,
+                db,
+                asset_id,
                 bucket=upload["bucket"],
                 object_key=object_key,
                 duration=metadata.duration,
@@ -283,12 +352,15 @@ async def upload_video(
             except Exception:
                 logger.exception("Failed to delete orphaned object %s", object_key)
             mark_asset_failed(
-                db, asset_id,
+                db,
+                asset_id,
                 status=ProcessingState.FAILED.value,
                 error_code="DB_PERSIST_FAILED",
                 progress=0,
             )
-            raise APIError(500, "DB_PERSIST_FAILED", "Failed to persist media record", asset_id=asset_id)
+            raise APIError(
+                500, "DB_PERSIST_FAILED", "Failed to persist media record", asset_id=asset_id
+            )
 
         # 10. Dispatch the durable workflow. The workflow id is already persisted,
         #     so if dispatch fails the asset stays in a recoverable UPLOADED state
@@ -305,7 +377,8 @@ async def upload_video(
             logger.exception("Workflow dispatch failed for asset %s", asset_id)
             set_asset_error(db, asset_id, error_code="WORKFLOW_DISPATCH_FAILED")
             raise APIError(
-                500, "WORKFLOW_DISPATCH_FAILED",
+                500,
+                "WORKFLOW_DISPATCH_FAILED",
                 "Media stored but processing could not be started; retry is safe",
                 asset_id=asset_id,
             )
@@ -345,3 +418,62 @@ def asset_status(
         last_error=asset.last_error,
         steps=steps,
     )
+
+
+@app.post(
+    "/v1/search",
+    response_model=SearchResponse,
+    responses={400: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+)
+def search(request: SearchRequest):
+    """Stable Week 7 search contract.
+
+    The model-serving and Qdrant retrieval backends are intentionally not hidden
+    here. Until those deploy, the route validates the contract, normalizes active
+    weights, returns an empty ranked list and exposes diagnostics for client tests.
+    """
+    try:
+        normalized = renormalize_active_weights(request.weights, set(request.modalities))
+    except ValueError as exc:
+        raise APIError(422, "INVALID_WEIGHTS", str(exc))
+
+    query_id = str(uuid.uuid4())
+    response = SearchResponse(
+        query_id=query_id,
+        results=[],
+        diagnostics={
+            "status": "NO_INDEX_READY",
+            "modalities": len(request.modalities),
+            "weights": normalized,
+        },
+    )
+    _SEARCH_CACHE[query_id] = response
+    return response
+
+
+@app.get(
+    "/v1/search/{query_id}",
+    response_model=SearchResponse,
+    responses={404: {"model": ErrorResponse}},
+)
+def search_status(query_id: str):
+    response = _SEARCH_CACHE.get(query_id)
+    if response is None:
+        raise APIError(404, "QUERY_NOT_FOUND", "Query not found")
+    return response
+
+
+@app.post("/v1/reindex/{asset_id}", responses={404: {"model": ErrorResponse}})
+def reindex_asset(asset_id: str, db: Session = Depends(get_db)):
+    asset = get_asset_status(db, asset_id)
+    if asset is None:
+        raise APIError(404, "ASSET_NOT_FOUND", "Asset not found")
+    return {"asset_id": asset_id, "status": "REINDEX_QUEUED"}
+
+
+@app.delete("/v1/assets/{asset_id}", responses={404: {"model": ErrorResponse}})
+def delete_asset(asset_id: str, db: Session = Depends(get_db)):
+    asset = get_asset_status(db, asset_id)
+    if asset is None:
+        raise APIError(404, "ASSET_NOT_FOUND", "Asset not found")
+    return {"asset_id": asset_id, "status": "DELETE_ACCEPTED"}

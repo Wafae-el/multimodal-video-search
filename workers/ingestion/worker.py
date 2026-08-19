@@ -13,6 +13,10 @@ from packages.workflow.activities import (
     normalize_video,
     extract_audio,
     generate_thumbnail,
+    segment_media,
+    index_speech,
+    index_visual,
+    score_audio_quality,
 )
 from packages.workflow.workflows import ProcessAssetWorkflow
 
@@ -49,12 +53,14 @@ async def main() -> None:
                 normalize_video,
                 extract_audio,
                 generate_thumbnail,
+                segment_media,
+                index_speech,
+                index_visual,
+                score_audio_quality,
             ],
             activity_executor=executor,
             max_concurrent_activities=settings.WORKER_ACTIVITY_THREADS,
-            graceful_shutdown_timeout=timedelta(
-                seconds=settings.WORKER_GRACEFUL_SHUTDOWN_SECONDS
-            ),
+            graceful_shutdown_timeout=timedelta(seconds=settings.WORKER_GRACEFUL_SHUTDOWN_SECONDS),
         )
 
         logger.info(
