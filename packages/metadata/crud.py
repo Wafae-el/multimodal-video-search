@@ -5,12 +5,14 @@ from packages.metadata.models import (
     Video,
     MediaFile,
     ProcessingStep,
+    Scene,
 )
 from packages.workflow.state_machine import (
     ProcessingState,
     TERMINAL_STATES,
     is_at_or_past,
 )
+from packages.metadata.models import SceneFrame
 
 
 def create_asset(
@@ -624,5 +626,95 @@ def get_processing_steps(db: Session, asset_id: str):
         db.query(ProcessingStep)
         .filter(ProcessingStep.video_id == asset.id)
         .order_by(ProcessingStep.id)
+        .all()
+    )
+
+def create_scene(
+    db: Session,
+    *,
+    video_id: int,
+    scene_index: int,
+    start_ms: int,
+    end_ms: int,
+    duration_ms: int,
+):
+    try:
+        scene = Scene(
+            video_id=video_id,
+            scene_index=scene_index,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            duration_ms=duration_ms,
+        )
+
+        db.add(scene)
+        db.commit()
+        db.refresh(scene)
+
+        return scene
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+
+def get_scenes(
+    db: Session,
+    video_id: int,
+):
+    return (
+        db.query(Scene)
+        .filter(Scene.video_id == video_id)
+        .order_by(Scene.scene_index)
+        .all()
+    )
+
+def create_scene_frame(
+    db: Session,
+    *,
+    scene_id: int,
+    timestamp_ms: int,
+    bucket: str,
+    object_key: str,
+    checksum: str,
+):
+    try:
+        existing = (
+            db.query(SceneFrame)
+            .filter(
+                SceneFrame.scene_id == scene_id,
+                SceneFrame.timestamp_ms == timestamp_ms,
+            )
+            .first()
+        )
+
+        if existing is not None:
+            return existing
+
+        frame = SceneFrame(
+            scene_id=scene_id,
+            timestamp_ms=timestamp_ms,
+            bucket=bucket,
+            object_key=object_key,
+            checksum=checksum,
+        )
+
+        db.add(frame)
+        db.commit()
+        db.refresh(frame)
+
+        return frame
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+
+def get_scene_frames(
+    db: Session,
+    scene_id: int,
+):
+    return (
+        db.query(SceneFrame)
+        .filter(SceneFrame.scene_id == scene_id)
         .all()
     )

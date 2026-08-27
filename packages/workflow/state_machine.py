@@ -8,6 +8,7 @@ class ProcessingState(str, Enum):
     NORMALIZING = "NORMALIZING"
     EXTRACTING_AUDIO = "EXTRACTING_AUDIO"
     GENERATING_THUMBNAIL = "GENERATING_THUMBNAIL"
+    DETECTING_SCENES = "DETECTING_SCENES"
     DONE = "DONE"
     FAILED = "FAILED"
     NO_AUDIO = "NO_AUDIO"
@@ -21,6 +22,7 @@ class ProcessingEvent(str, Enum):
     NORMALIZE_OK = "NORMALIZE_OK"
     AUDIO_OK = "AUDIO_OK"
     THUMBNAIL_OK = "THUMBNAIL_OK"
+    SCENES_OK = "SCENES_OK"
 
     # Événements spéciaux / reprises
     RETRY = "RETRY"
@@ -50,10 +52,14 @@ def next_state(state: ProcessingState, event: ProcessingEvent) -> ProcessingStat
         (ProcessingState.EXTRACTING_AUDIO, ProcessingEvent.AUDIO_OK):
             ProcessingState.GENERATING_THUMBNAIL,
 
+        # Nouveau Week 2
         (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.THUMBNAIL_OK):
+            ProcessingState.DETECTING_SCENES,
+
+        (ProcessingState.DETECTING_SCENES, ProcessingEvent.SCENES_OK):
             ProcessingState.DONE,
 
-        # Gestion des erreurs spécifiques
+        # Gestion des erreurs
         (ProcessingState.VALIDATING, ProcessingEvent.NO_AUDIO):
             ProcessingState.NO_AUDIO,
 
@@ -68,24 +74,16 @@ def next_state(state: ProcessingState, event: ProcessingEvent) -> ProcessingStat
 
         (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.ERROR):
             ProcessingState.FAILED,
+
+        (ProcessingState.DETECTING_SCENES, ProcessingEvent.ERROR):
+            ProcessingState.FAILED,
     }
 
-    # Lève une exception explicite si la transition est invalide
     if (state, event) not in transitions:
         raise ValueError(f"Invalid transition: {state} + {event}")
 
     return transitions[(state, event)]
 
-
-# ---------------------------------------------------------------------------
-# Idempotent, monotonic advancement (used for Temporal-retry safety).
-#
-# ``next_state`` above is strict and rejects any transition that is not the
-# exact expected one — which is correct for validating a single event, but a
-# retried activity may find the asset already advanced (VALIDATING, PROBING,
-# FAILED, ...). To stay retry-safe we advance along a linear ordering and treat
-# "already at or past the target" as a no-op instead of an error.
-# ---------------------------------------------------------------------------
 
 STATE_ORDER = [
     ProcessingState.UPLOADED,
@@ -94,9 +92,14 @@ STATE_ORDER = [
     ProcessingState.NORMALIZING,
     ProcessingState.EXTRACTING_AUDIO,
     ProcessingState.GENERATING_THUMBNAIL,
+    ProcessingState.DETECTING_SCENES,
     ProcessingState.DONE,
 ]
-STATE_RANK = {state: index for index, state in enumerate(STATE_ORDER)}
+
+STATE_RANK = {
+    state: index
+    for index, state in enumerate(STATE_ORDER)
+}
 
 TERMINAL_STATES = {
     ProcessingState.DONE,
@@ -105,8 +108,10 @@ TERMINAL_STATES = {
 }
 
 
-def is_at_or_past(current: ProcessingState, target: ProcessingState) -> bool:
-    """True if ``current`` is the same as, or further along than, ``target``."""
+def is_at_or_past(
+    current: ProcessingState,
+    target: ProcessingState,
+) -> bool:
     if current not in STATE_RANK or target not in STATE_RANK:
         return False
     return STATE_RANK[current] >= STATE_RANK[target]

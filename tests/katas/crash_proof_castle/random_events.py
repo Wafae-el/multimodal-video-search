@@ -14,6 +14,7 @@ EVENTS = [
     ProcessingEvent.AUDIO_OK,
     ProcessingEvent.THUMBNAIL_OK,
     ProcessingEvent.ERROR,
+    ProcessingEvent.SCENES_OK,
 ]
 
 
@@ -29,6 +30,7 @@ VALID_TRANSITIONS = {
     (ProcessingState.EXTRACTING_AUDIO, ProcessingEvent.ERROR),
     (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.THUMBNAIL_OK),
     (ProcessingState.GENERATING_THUMBNAIL, ProcessingEvent.ERROR),
+    (ProcessingState.DETECTING_SCENES, ProcessingEvent.SCENES_OK),
 }
 
 

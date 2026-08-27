@@ -5,7 +5,7 @@
 
 services:
   postgres:
-    image: postgres:17.2
+    image: postgres:15-alpine
     container_name: postgres_db
     restart: unless-stopped
     environment:
@@ -15,7 +15,7 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+    - compose_vq_pg_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-video_search}"]
       interval: 10s
@@ -34,7 +34,7 @@ services:
       - "${MINIO_API_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - minio_data:/data
+    - compose_vq_minio_data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
@@ -125,6 +125,10 @@ services:
     # whose health is observed via logs and Temporal task-queue pollers.
 
 volumes:
-  postgres_data:
-  minio_data:
+  compose_vq_pg_data:
+    external: true
+
+  compose_vq_minio_data:
+    external: true
+
   qdrant_data:

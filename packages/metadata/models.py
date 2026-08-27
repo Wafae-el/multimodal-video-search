@@ -79,6 +79,12 @@ class Video(Base):
         cascade="all, delete-orphan",
     )
 
+    scenes = relationship(
+        "Scene",
+        back_populates="video",
+        cascade="all, delete-orphan",
+        )
+
 
 class MediaFile(Base):
     __tablename__ = "media_files"
@@ -176,4 +182,80 @@ class ProcessingStep(Base):
     video = relationship(
         "Video",
         back_populates="processing_steps",
+    )
+
+class Scene(Base):
+    __tablename__ = "scenes"
+
+    id = Column(Integer, primary_key=True)
+
+    video_id = Column(
+        Integer,
+        ForeignKey("media_assets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    scene_index = Column(
+        Integer,
+        nullable=False,
+    )
+
+    start_ms = Column(
+        Integer,
+        nullable=False,
+    )
+
+    end_ms = Column(
+        Integer,
+        nullable=False,
+    )
+
+    duration_ms = Column(
+        Integer,
+        nullable=False,
+    )
+
+    created_at = Column(
+        DateTime,
+        server_default=func.now(),
+    )
+
+    video = relationship(
+        "Video",
+        back_populates="scenes",
+    )
+
+    frames = relationship(
+    "SceneFrame",
+    back_populates="scene",
+    cascade="all, delete-orphan",
+)
+
+class SceneFrame(Base):
+    __tablename__ = "scene_frames"
+
+    id = Column(Integer, primary_key=True)
+
+    scene_id = Column(
+        Integer,
+        ForeignKey("scenes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    timestamp_ms = Column(Integer, nullable=False)
+
+    bucket = Column(String)
+
+    object_key = Column(String)
+
+    checksum = Column(String)
+
+    created_at = Column(
+        DateTime,
+        server_default=func.now(),
+    )
+
+    scene = relationship(
+        "Scene",
+        back_populates="frames",
     )

@@ -12,7 +12,11 @@ from packages.workflow.activities import (
     probe_video,
     normalize_video,
     extract_audio,
+    transcribe_audio,
     generate_thumbnail,
+    detect_scenes,
+    generate_scene_frames,
+
 )
 from packages.workflow.workflows import ProcessAssetWorkflow
 
@@ -48,7 +52,10 @@ async def main() -> None:
                 probe_video,
                 normalize_video,
                 extract_audio,
+                transcribe_audio,
                 generate_thumbnail,
+                detect_scenes,
+                generate_scene_frames,
             ],
             activity_executor=executor,
             max_concurrent_activities=settings.WORKER_ACTIVITY_THREADS,

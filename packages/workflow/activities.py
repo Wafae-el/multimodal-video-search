@@ -1,6 +1,8 @@
 import hashlib
 import shutil
 import threading
+import librosa
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +30,42 @@ from packages.storage.minio_service import (
 from packages.workflow.state_machine import ProcessingState
 from packages.workflow.operation_key import build_operation_key  # re-exported for callers/tests
 from packages.workflow.contracts import ProcessAssetInput, ACTIVITY_MAX_ATTEMPTS
+
+from packages.media.scene_detector import SceneDetector
+
+from packages.media.frame_selector import FrameSelector
+from packages.media.frame_extractor import FrameExtractor
+from packages.media.frame_quality import FrameQuality
+from packages.media.duplicate_filter import DuplicateFilter
+
+from packages.storage.minio_service import (
+    upload_scene_frame,
+)
+
+from packages.metadata import crud
+
+from packages.retrieval.service import HybridRetrievalService
+
+from packages.retrieval.visual_qdrant_store import VisualQdrantStore
+from packages.visual.openclip_encoder import OpenCLIPVisualEncoder
+from packages.storage.minio_service import client
+from packages.audio.window_extractor import (
+    AudioWindowExtractor,
+)
+from packages.audio.clap_encoder import (
+    CLAPAudioEncoder,
+)
+from packages.retrieval.audio_qdrant_store import (
+    AudioQdrantStore,
+)
+from packages.audio.quality import AudioQualityAnalyzer
+from packages.audio.speech_windows import (
+    AudioSpeechWindowAnalyzer,
+)
+
+from packages.speech.whisper_service import (
+    WhisperService,
+)
 
 
 WORKSPACE_ROOT = Path("workspace")
@@ -142,7 +180,11 @@ def _run_step(
     info = _load_asset_info(asset_id)
 
     operation_key = build_operation_key(
-        info.source_checksum, step_name, info.pipeline_version, tool_version
+    info.asset_id,
+    info.source_checksum,
+    step_name,
+    info.pipeline_version,
+    tool_version,
     )
     ctx = _log_context(asset_id, step_name, operation_key)
 
@@ -167,7 +209,7 @@ def _run_step(
     # exists is reused as-is — FFmpeg is never invoked again and the attempt count
     # is not increased.
     if step["status"] == "completed":
-        if not step["output_key"] or object_exists(step["output_key"]):
+        if step["output_key"] and object_exists(step["output_key"]):
             with get_session() as db:
                 crud.advance_asset_state(db, asset_id, target=done_state, progress=done_progress)
             activity.logger.info(
@@ -318,6 +360,253 @@ def _do_extract_audio(info: AssetInfo, workdir: Path) -> dict:
         "output_checksum": audio["checksum"],
         "file_type": "audio",
     }
+def _do_index_audio_windows(
+    info: AssetInfo,
+    workdir: Path,
+) -> dict:
+
+    # ==================================================
+    # 1. DOWNLOAD EXTRACTED AUDIO
+    # ==================================================
+
+    audio_object_key = (
+        f"media-derived/"
+        f"{info.asset_id}/"
+        f"audio/source.wav"
+    )
+
+    local_audio = (
+        workdir / "source_audio.wav"
+    )
+
+    client.fget_object(
+        "media",
+        audio_object_key,
+        str(local_audio),
+    )
+
+    if not local_audio.exists():
+        raise FileNotFoundError(local_audio)
+
+    # ==================================================
+    # 2. GENERATE 5s WINDOWS / 2.5s OVERLAP
+    # ==================================================
+
+    import librosa
+
+    extractor = AudioWindowExtractor(
+        window_ms=5000,
+        overlap_ms=2500,
+    )
+
+    windows_dir = (
+        workdir / "audio_windows"
+    )
+
+    extracted = extractor.extract(
+        local_audio,
+        windows_dir,
+    )
+
+    if not extracted:
+        return {
+            "indexed_windows": 0,
+            "skipped_silent_windows": 0,
+            "asr_segments": 0,
+            "collection": "video_audio_windows",
+        }
+
+    windows = [
+        item[0]
+        for item in extracted
+    ]
+
+    window_paths = [
+        item[1]
+        for item in extracted
+    ]
+
+    # ==================================================
+    # 3. WHISPER ASR
+    # ==================================================
+
+    from packages.speech.whisper_service import (
+        WhisperService,
+    )
+
+    whisper = WhisperService(
+        model_size="small",
+        device="cpu",
+        compute_type="int8",
+    )
+
+    segments = whisper.transcribe(
+        local_audio
+    )
+
+    # ==================================================
+    # 4. MAP ASR SEGMENTS TO WINDOWS
+    # ==================================================
+
+    from packages.audio.speech_windows import (
+        AudioSpeechWindowAnalyzer,
+    )
+
+    speech_analyzer = (
+        AudioSpeechWindowAnalyzer()
+    )
+
+    speech_windows = (
+        speech_analyzer.analyze(
+            windows,
+            segments,
+        )
+    )
+
+    # ==================================================
+    # 5. AUDIO QUALITY
+    # ==================================================
+
+    quality_analyzer = AudioQualityAnalyzer()
+
+    retained_windows = []
+    retained_paths = []
+    retained_quality = []
+
+    skipped_silent = 0
+
+    for window, window_path, speech_window in zip(
+        windows,
+        window_paths,
+        speech_windows,
+    ):
+
+        # --------------------------------------------------
+        # Skip silent windows
+        # --------------------------------------------------
+
+        if speech_window.speech_ratio <= 0.0:
+            skipped_silent += 1
+            continue
+
+        # --------------------------------------------------
+        # Load audio samples
+        # --------------------------------------------------
+
+        audio, sampling_rate = librosa.load(
+            str(window_path),
+            sr=48000,
+            mono=True,
+        )
+
+        # --------------------------------------------------
+        # Compute audio quality
+        # --------------------------------------------------
+
+        quality_result = (
+            quality_analyzer.analyze(
+                audio=audio,
+                asr_confidence=(
+                    speech_window.asr_confidence
+                ),
+            )
+        )
+
+        # --------------------------------------------------
+        # Keep only valid acoustic candidates
+        # --------------------------------------------------
+
+        retained_windows.append(window)
+        retained_paths.append(window_path)
+
+        retained_quality.append(
+            {
+                "speech_ratio": float(
+                    quality_result.speech_ratio
+                ),
+                "clipping_ratio": float(
+                    quality_result.clipping_ratio
+                ),
+                "loudness": float(
+                    quality_result.loudness
+                ),
+                "snr_proxy": float(
+                    quality_result.snr_proxy
+                ),
+                "snr_norm": float(
+                    quality_result.snr_norm
+                ),
+                "asr_confidence": float(
+                    speech_window.asr_confidence
+                ),
+                "quality_score": float(
+                    quality_result.quality
+                ),
+            }
+        )
+
+    # ==================================================
+    # 6. NO ACOUSTIC WINDOWS
+    # ==================================================
+
+    if not retained_windows:
+        return {
+            "indexed_windows": 0,
+            "skipped_silent_windows": skipped_silent,
+            "asr_segments": len(segments),
+            "collection": "video_audio_windows",
+        }
+
+    # ==================================================
+    # 7. CLAP EMBEDDINGS
+    # ==================================================
+
+    encoder = CLAPAudioEncoder(
+        device="cpu",
+    )
+
+    embeddings = (
+        encoder.encode_audio_batch(
+            retained_paths
+        )
+    )
+
+    # ==================================================
+    # 8. STORE IN QDRANT
+    # ==================================================
+
+    store = AudioQdrantStore(
+        url="http://qdrant:6333",
+    )
+
+    store.create_collection()
+
+    quality_scores = [
+        item["quality_score"]
+        for item in retained_quality
+    ]
+
+    store.upsert_windows(
+        windows=retained_windows,
+        embeddings=embeddings,
+        video_id=info.id,
+        quality_scores=quality_scores,
+        quality_metadata=retained_quality,
+    )
+
+    # ==================================================
+    # 9. RESULT
+    # ==================================================
+
+    return {
+        "indexed_windows": len(
+            retained_windows
+        ),
+        "skipped_silent_windows": skipped_silent,
+        "total_windows": len(windows),
+        "asr_segments": len(segments),
+        "collection": "video_audio_windows",
+    }
 
 
 def _do_thumbnail(info: AssetInfo, workdir: Path) -> dict:
@@ -375,7 +664,22 @@ def extract_audio(request: ProcessAssetInput) -> dict:
         done_progress=90,
         work=_do_extract_audio,
     )
+@activity.defn
+def index_audio_windows(
+    request: ProcessAssetInput,
+) -> dict:
 
+    return _run_step(
+        request,
+        step_name="audio_window_indexing",
+        tool_version="clap-audio-v1",
+        start_states=[
+            ProcessingState.EXTRACTING_AUDIO,
+        ],
+        done_state=ProcessingState.EXTRACTING_AUDIO,
+        done_progress=95,
+        work=_do_index_audio_windows,
+    )
 
 @activity.defn
 def generate_thumbnail(request: ProcessAssetInput) -> dict:
@@ -388,3 +692,356 @@ def generate_thumbnail(request: ProcessAssetInput) -> dict:
         done_progress=100,
         work=_do_thumbnail,
     )
+
+
+def _do_detect_scenes(info: AssetInfo, workdir: Path) -> dict:
+    proxy = _ensure_proxy(info, workdir)
+
+    detector = SceneDetector()
+    scenes = detector.detect(proxy)
+
+    with get_session() as db:
+        for scene in scenes:
+            crud.create_scene(
+                db,
+                video_id=info.id,
+                scene_index=scene.scene_id,
+                start_ms=scene.start_ms,
+                end_ms=scene.end_ms,
+                duration_ms=scene.duration_ms,
+            )
+
+    return {
+        "output_bucket": None,
+        "output_key": None,
+        "output_checksum": None,
+        "file_type": None,
+    }
+
+@activity.defn
+def detect_scenes(request: ProcessAssetInput) -> dict:
+    return _run_step(
+        request,
+        step_name="scene_detection",
+        tool_version="scenedetect-v1",
+        start_states=[ProcessingState.DETECTING_SCENES],
+        done_state=ProcessingState.DONE,
+        done_progress=100,
+        work=_do_detect_scenes,
+    )
+
+def _do_generate_scene_frames(
+    info: AssetInfo,
+    workdir: Path,
+) -> dict:
+
+    proxy = _ensure_proxy(info, workdir)
+
+    selector = FrameSelector()
+    extractor = FrameExtractor()
+    quality = FrameQuality()
+    duplicate = DuplicateFilter()
+
+    last_upload = None
+
+    with get_session() as db:
+
+        scenes = crud.get_scenes(
+            db,
+            video_id=info.id,
+        )
+
+        frame_requests = selector.select(scenes)
+
+        previous_frame = None
+
+        for frame in frame_requests:
+
+            output_file = (
+                workdir
+                / f"scene_{frame.scene_index}.jpg"
+            )
+
+            extractor.extract(
+                proxy,
+                frame.timestamp_ms,
+                output_file,
+            )
+
+            if quality.is_black(output_file):
+                continue
+            if quality.is_blurry(output_file):
+                continue
+            if quality.is_bright(output_file):
+                continue
+            if not quality.has_sufficient_resolution(output_file):
+                continue
+
+            if (
+                previous_frame is not None
+                and duplicate.are_similar(
+                    previous_frame,
+                    output_file,
+                )
+            ):
+                continue
+
+            previous_frame = output_file
+
+            upload = upload_scene_frame(
+                asset_id=info.asset_id,
+                scene_index=frame.scene_index,
+                file_path=output_file,
+            )
+
+            last_upload = upload
+
+            crud.create_scene_frame(
+                db,
+                scene_id=frame.scene_id,
+                timestamp_ms=frame.timestamp_ms,
+                bucket=upload["bucket"],
+                object_key=upload["object_key"],
+                checksum=upload["etag"],
+            )
+
+    return {
+        "output_bucket": (
+            last_upload["bucket"]
+            if last_upload
+            else None
+        ),
+        "output_key": None,
+        "output_checksum": None,
+        "file_type": "scene_frames",
+    }
+
+
+@activity.defn
+def generate_scene_frames(
+    request: ProcessAssetInput,
+) -> dict:
+    return _run_step(
+        request,
+        step_name="scene_frames",
+        tool_version="frame-selection-v1",
+        start_states=[ProcessingState.DONE],
+        done_state=ProcessingState.DONE,
+        done_progress=100,
+        work=_do_generate_scene_frames,
+    )
+
+@activity.defn
+def index_visual_frames(
+    request: ProcessAssetInput,
+) -> dict:
+    """
+    Encode generated scene frames with OpenCLIP and
+    index their embeddings in the visual Qdrant collection.
+    """
+
+    from pathlib import Path
+    import tempfile
+
+    encoder = OpenCLIPVisualEncoder(
+        model_name="ViT-B-32",
+        pretrained="openai",
+        device="cpu",
+    )
+
+    store = VisualQdrantStore(
+        url="http://qdrant:6333",
+    )
+
+    store.create_collection()
+
+    indexed = 0
+
+    with get_session() as db:
+
+        video = crud.get_asset_status(
+            db,
+            request.asset_id,
+        )
+
+        if video is None:
+            raise ValueError(
+                f"Video not found for asset_id={request.asset_id}"
+            )
+
+        frames = []
+
+        for scene in video.scenes:
+            scene_frames = crud.get_scene_frames(
+                db,
+                scene.id,
+            )
+
+            frames.extend(scene_frames)
+
+        if not frames:
+            return {
+                "indexed_frames": 0,
+                "collection": "video_visual_frames",
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+
+            local_paths = []
+            valid_frames = []
+
+            for frame in frames:
+
+                if not frame.object_key:
+                    continue
+
+                bucket = frame.bucket or "media"
+
+                local_path = (
+                    Path(temp_dir)
+                    / f"scene_{frame.scene_id}.jpg"
+                )
+
+                client.fget_object(
+                    bucket,
+                    frame.object_key,
+                    str(local_path),
+                )
+
+                local_paths.append(local_path)
+                valid_frames.append(frame)
+
+            if not local_paths:
+                return {
+                    "indexed_frames": 0,
+                    "collection": "video_visual_frames",
+                }
+
+            embeddings = encoder.encode_images(
+                local_paths
+            )
+
+            class FrameRecord:
+                def __init__(self, frame):
+                    self.scene_id = frame.scene_id
+                    self.timestamp_ms = frame.timestamp_ms
+                    self.object_key = frame.object_key
+
+            frame_records = [
+                FrameRecord(frame)
+                for frame in valid_frames
+            ]
+
+            store.upsert_frames(
+                frames=frame_records,
+                embeddings=embeddings,
+                video_id=video.id,
+            )
+
+            indexed = len(frame_records)
+
+    return {
+        "indexed_frames": indexed,
+        "collection": "video_visual_frames",
+    }
+@activity.defn
+def transcribe_audio(asset_id: str) -> dict:
+    """
+    Transcribe extracted audio with Faster-Whisper,
+    normalize the transcript and create searchable chunks.
+    """
+
+    from pathlib import Path
+    import tempfile
+
+    from packages.metadata.database import SessionLocal
+    from packages.metadata.models import Video
+    from packages.storage.minio_service import client
+    from packages.speech.whisper_service import WhisperService
+    from packages.speech.normalizer import TranscriptNormalizer
+    from packages.speech.chunker import TranscriptChunker
+
+    with SessionLocal() as db:
+        asset = (
+            db.query(Video)
+            .filter(Video.asset_id == asset_id)
+            .first()
+        )
+
+        if asset is None:
+            raise ValueError(f"Asset not found: {asset_id}")
+
+        if not asset.minio_bucket or not asset.minio_object_key:
+            raise ValueError(f"Media object not found for asset: {asset_id}")
+
+        bucket = asset.minio_bucket
+        object_key = asset.minio_object_key
+
+    audio_object_key = (
+        f"media-derived/{asset_id}/audio/source.wav"
+    )
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".wav",
+        delete=False,
+    ) as tmp:
+        local_audio = Path(tmp.name)
+
+    try:
+        client.fget_object(
+            bucket,
+            audio_object_key,
+            str(local_audio),
+        )
+
+        whisper = WhisperService(
+            model_size="small",
+            device="cpu",
+            compute_type="int8",
+        )
+
+        segments = whisper.transcribe(local_audio)
+
+        if not segments:
+            return {
+                "asset_id": asset_id,
+                "segments": 0,
+                "chunks": 0,
+                "status": "NO_SPEECH",
+            }
+
+        normalized = TranscriptNormalizer().normalize(segments)
+
+        chunks = TranscriptChunker().chunk(normalized)
+        normalized = TranscriptNormalizer().normalize(segments)
+        chunks = TranscriptChunker().chunk(normalized)
+        video_id = asset.id
+        retrieval = HybridRetrievalService(
+            qdrant_url="http://qdrant:6333",
+        )
+        retrieval.index(
+            chunks=chunks,
+            video_id=video_id,
+        )
+
+        return {
+            "asset_id": asset_id,
+            "segments": len(segments),
+            "chunks": [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "start_ms": chunk.start_ms,
+                    "end_ms": chunk.end_ms,
+                    "text": chunk.text,
+                    "normalized_text": chunk.normalized_text,
+                    "source_segment_ids": chunk.source_segment_ids,
+                    "confidence": chunk.confidence,
+                }
+                for chunk in chunks
+            ],
+            "status": "COMPLETED",
+        }
+
+    finally:
+        if local_audio.exists():
+            local_audio.unlink()

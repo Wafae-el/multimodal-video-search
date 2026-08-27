@@ -200,7 +200,13 @@ def test_precompleted_step_is_reused_without_ffmpeg(env):
     proxy_key = build_proxy_object_key(asset_id)
 
     from packages.workflow.operation_key import build_operation_key
-    op_key = build_operation_key("chk-1", "normalize", "v1", "ffmpeg-normalizer-v1")
+    op_key = build_operation_key(
+        asset_id,
+        "chk-1",
+        "normalize",
+        "v1",
+        "ffmpeg-normalizer-v1",
+    )
     with Session() as db:
         asset = db.query(Video).filter(Video.asset_id == asset_id).first()
         db.add(ProcessingStep(

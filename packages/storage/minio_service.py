@@ -153,3 +153,33 @@ def upload_normalized_video(
         "etag": result.etag,
         "size": file_path.stat().st_size,
     }
+
+def build_scene_frame_object_key(
+    asset_id: str,
+    scene_index: int,
+) -> str:
+    return f"media-derived/{asset_id}/frames/scene_{scene_index}.jpg"
+
+
+def upload_scene_frame(
+    asset_id: str,
+    scene_index: int,
+    file_path: Path,
+):
+    object_key = build_scene_frame_object_key(
+        asset_id,
+        scene_index,
+    )
+
+    result = client.fput_object(
+        settings.MINIO_BUCKET,
+        object_key,
+        str(file_path),
+    )
+
+    return {
+        "bucket": settings.MINIO_BUCKET,
+        "object_key": object_key,
+        "etag": result.etag,
+        "size": file_path.stat().st_size,
+    }

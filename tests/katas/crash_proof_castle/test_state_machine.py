@@ -46,8 +46,13 @@ def test_thumbnail_ok():
     assert next_state(
         ProcessingState.GENERATING_THUMBNAIL,
         ProcessingEvent.THUMBNAIL_OK,
-    ) == ProcessingState.DONE
+    ) == ProcessingState.DETECTING_SCENES
 
+def test_detect_scenes_ok():
+    assert next_state(
+        ProcessingState.DETECTING_SCENES,
+        ProcessingEvent.SCENES_OK,
+    ) == ProcessingState.DONE
 
 def test_no_audio():
     assert next_state(

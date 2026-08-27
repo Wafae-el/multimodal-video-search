@@ -16,6 +16,8 @@ minio
 
 ffmpeg-python
 
+scenedetect==0.7.1
+
 qdrant-client
 
 python-dotenv
@@ -23,3 +25,8 @@ python-dotenv
 pytest
 pytest-asyncio
 httpx
+Pillow
+faster-whisper
+
+sentence-transformers
+rank-bm25
