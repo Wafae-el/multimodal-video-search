@@ -6,7 +6,7 @@ from packages.retrieval.visual_qdrant_store import VisualQdrantStore
 
 
 @dataclass
-class TestFrame:
+class FrameMetadata:
     scene_id: int
     timestamp_ms: int
     object_key: str
@@ -22,7 +22,7 @@ def main():
     # --------------------------------------------------
 
     frames = [
-        TestFrame(
+        FrameMetadata(
             scene_id=4,
             timestamp_ms=18718,
             object_key=(
@@ -34,7 +34,7 @@ def main():
     ]
 
     image_paths = [
-        Path("/tmp/test_frame.jpg"),
+        Path(__file__).parent / "fixtures" / "test_frame.jpg",
     ]
 
     print("FRAMES =", len(frames))
@@ -142,6 +142,10 @@ def main():
     print("=" * 70)
     print("VISUAL BATCH INDEXING = PASS")
     print("=" * 70)
+
+
+def test_visual_batch_index():
+    main()
 
 
 if __name__ == "__main__":

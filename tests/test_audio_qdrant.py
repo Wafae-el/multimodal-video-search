@@ -1,22 +1,16 @@
 import numpy as np
+import pytest
 
-from packages.audio.windowing import (
-    AudioWindowGenerator,
-)
-from packages.retrieval.audio_qdrant_store import (
-    AudioQdrantStore,
-)
+from packages.audio.windowing import AudioWindowGenerator
+from packages.retrieval.audio_qdrant_store import AudioQdrantStore
 
 
 VIDEO_ID = 10
+QDRANT_URL = "http://qdrant:6333"
 
 
-def main():
-
-    print("=" * 70)
-    print("WEEK 5 - AUDIO QDRANT")
-    print("=" * 70)
-
+@pytest.mark.integration
+def test_audio_qdrant():
     # ---------------------------------------------------------
     # 1. Generate audio windows
     # ---------------------------------------------------------
@@ -30,16 +24,7 @@ def main():
         duration_ms=15000
     )
 
-    print(
-        "WINDOWS =",
-        len(windows),
-    )
-
     assert len(windows) == 5
-
-    print(
-        "PASS: Audio windows"
-    )
 
     # ---------------------------------------------------------
     # 2. Create deterministic test embeddings
@@ -47,10 +32,7 @@ def main():
 
     embeddings = []
 
-    for index in range(
-        len(windows)
-    ):
-
+    for index in range(len(windows)):
         vector = np.zeros(
             512,
             dtype=np.float32,
@@ -58,40 +40,20 @@ def main():
 
         vector[index] = 1.0
 
-        embeddings.append(
-            vector
-        )
-
-    print(
-        "EMBEDDINGS =",
-        len(embeddings),
-    )
-
-    print(
-        "DIMENSION =",
-        embeddings[0].shape[0],
-    )
+        embeddings.append(vector)
 
     assert len(embeddings) == 5
     assert embeddings[0].shape[0] == 512
-
-    print(
-        "PASS: Test embeddings"
-    )
 
     # ---------------------------------------------------------
     # 3. Create Qdrant collection
     # ---------------------------------------------------------
 
     store = AudioQdrantStore(
-        url="http://qdrant:6333",
+        url=QDRANT_URL,
     )
 
     store.create_collection()
-
-    print(
-        "PASS: Audio collection"
-    )
 
     # ---------------------------------------------------------
     # 4. Index windows
@@ -103,10 +65,6 @@ def main():
         video_id=VIDEO_ID,
     )
 
-    print(
-        "PASS: Audio windows indexed"
-    )
-
     # ---------------------------------------------------------
     # 5. Search using first window embedding
     # ---------------------------------------------------------
@@ -116,28 +74,9 @@ def main():
         limit=3,
     )
 
-    print()
-    print(
-        "SEARCH RESULTS:"
-    )
-
-    for result in results:
-
-        print(
-            result
-        )
-
-        print(
-            "PAYLOAD =",
-            result.payload,
-        )
-
     assert len(results) >= 1
 
-    assert (
-        results[0].payload["video_id"]
-        == VIDEO_ID
-    )
+    assert results[0].payload["video_id"] == VIDEO_ID
 
     assert (
         results[0].payload["start_ms"]
@@ -148,20 +87,3 @@ def main():
         results[0].payload["end_ms"]
         == windows[0].end_ms
     )
-
-    print(
-        "PASS: Correct audio window first"
-    )
-
-    print(
-        "PASS: Payload metadata"
-    )
-
-    print()
-    print("=" * 70)
-    print("AUDIO QDRANT = PASS")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

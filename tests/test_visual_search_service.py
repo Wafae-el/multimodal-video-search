@@ -216,5 +216,9 @@ def main():
     print("=" * 70)
 
 
+def test_visual_search_service():
+    main()
+
+
 if __name__ == "__main__":
     main()

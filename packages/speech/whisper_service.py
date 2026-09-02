@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from faster_whisper import WhisperModel
+from functools import lru_cache
 
 
 @dataclass(frozen=True)
@@ -13,6 +14,17 @@ class TranscriptSegment:
     confidence: float
     language: str
 
+@lru_cache(maxsize=4)
+def get_whisper_model(
+    model_size: str,
+    device: str,
+    compute_type: str,
+) -> WhisperModel:
+    return WhisperModel(
+        model_size,
+        device=device,
+        compute_type=compute_type,
+    )
 
 class WhisperService:
     def __init__(
@@ -21,10 +33,10 @@ class WhisperService:
         device: str = "cpu",
         compute_type: str = "int8",
     ):
-        self.model = WhisperModel(
+        self.model = get_whisper_model(
             model_size,
-            device=device,
-            compute_type=compute_type,
+            device,
+            compute_type,
         )
 
     def transcribe(

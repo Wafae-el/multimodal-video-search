@@ -249,5 +249,9 @@ def main():
     print("=" * 70)
 
 
+def test_visual_memory_match():
+    main()
+
+
 if __name__ == "__main__":
     main()

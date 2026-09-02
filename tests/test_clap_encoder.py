@@ -9,12 +9,7 @@ from packages.audio.clap_encoder import CLAPAudioEncoder
 AUDIO_PATH = Path("tests/test_clap_audio.wav")
 
 
-def main():
-
-    print("=" * 70)
-    print("WEEK 5 - CLAP AUDIO ENCODER")
-    print("=" * 70)
-
+def test_clap_encoder():
     # ---------------------------------------------------------
     # 1. Create synthetic audio
     # ---------------------------------------------------------
@@ -30,7 +25,8 @@ def main():
     )
 
     audio = (
-        0.2 * np.sin(
+        0.2
+        * np.sin(
             2 * np.pi * 440 * t
         )
     ).astype(np.float32)
@@ -41,8 +37,6 @@ def main():
         sample_rate,
     )
 
-    print("PASS: Test audio created")
-
     # ---------------------------------------------------------
     # 2. Load CLAP
     # ---------------------------------------------------------
@@ -51,41 +45,20 @@ def main():
         device="cpu",
     )
 
-    print(
-        "PASS: CLAP loaded"
-    )
-
-    print(
-        "CLAP DIMENSION =",
-        encoder.dimension,
-    )
-
     assert encoder.dimension == 512
 
     # ---------------------------------------------------------
     # 3. Audio embedding
     # ---------------------------------------------------------
 
-    audio_embedding = (
-        encoder.encode_audio(
-            AUDIO_PATH
-        )
-    )
-
-    print(
-        "AUDIO EMBEDDING DIMENSION =",
-        len(audio_embedding),
+    audio_embedding = encoder.encode_audio(
+        AUDIO_PATH
     )
 
     audio_norm = float(
         np.linalg.norm(
             audio_embedding
         )
-    )
-
-    print(
-        "AUDIO NORM =",
-        audio_norm,
     )
 
     assert len(audio_embedding) == 512
@@ -95,34 +68,18 @@ def main():
         atol=1e-4,
     )
 
-    print(
-        "PASS: Audio embedding"
-    )
-
     # ---------------------------------------------------------
     # 4. Text embedding
     # ---------------------------------------------------------
 
-    text_embedding = (
-        encoder.encode_text(
-            "a musical sound"
-        )
-    )
-
-    print(
-        "TEXT EMBEDDING DIMENSION =",
-        len(text_embedding),
+    text_embedding = encoder.encode_text(
+        "a musical sound"
     )
 
     text_norm = float(
         np.linalg.norm(
             text_embedding
         )
-    )
-
-    print(
-        "TEXT NORM =",
-        text_norm,
     )
 
     assert len(text_embedding) == 512
@@ -132,12 +89,8 @@ def main():
         atol=1e-4,
     )
 
-    print(
-        "PASS: Text embedding"
-    )
-
     # ---------------------------------------------------------
-    # 5. Audio ↔ Text similarity
+    # 5. Audio -> Text similarity
     # ---------------------------------------------------------
 
     similarity = float(
@@ -147,49 +100,20 @@ def main():
         )
     )
 
-    print(
-        "AUDIO/TEXT SIMILARITY =",
-        similarity,
-    )
-
     assert -1.0 <= similarity <= 1.0
-
-    print(
-        "PASS: Audio/Text cosine similarity"
-    )
 
     # ---------------------------------------------------------
     # 6. Batch encoding
     # ---------------------------------------------------------
 
-    batch = (
-        encoder.encode_audio_batch(
-            [
-                AUDIO_PATH,
-                AUDIO_PATH,
-            ]
-        )
-    )
-
-    print(
-        "BATCH SHAPE =",
-        batch.shape,
+    batch = encoder.encode_audio_batch(
+        [
+            AUDIO_PATH,
+            AUDIO_PATH,
+        ]
     )
 
     assert batch.shape == (
         2,
         512,
     )
-
-    print(
-        "PASS: Batch audio encoding"
-    )
-
-    print()
-    print("=" * 70)
-    print("CLAP AUDIO ENCODER = PASS")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

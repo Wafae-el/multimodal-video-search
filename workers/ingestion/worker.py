@@ -6,17 +6,18 @@ from datetime import timedelta
 
 from temporalio.client import Client
 from temporalio.worker import Worker
+from packages.speech.whisper_service import get_whisper_model
 
 from packages.config.settings import settings
 from packages.workflow.activities import (
     probe_video,
     normalize_video,
     extract_audio,
+    index_audio_windows,
     transcribe_audio,
     generate_thumbnail,
     detect_scenes,
     generate_scene_frames,
-
 )
 from packages.workflow.workflows import ProcessAssetWorkflow
 
@@ -26,6 +27,13 @@ logger = logging.getLogger("worker")
 
 async def main() -> None:
     client = await Client.connect(settings.TEMPORAL_ADDRESS)
+    logger.info("Loading Whisper model...")
+    get_whisper_model(
+        "small",
+        "cpu",
+        "int8",
+    )
+    logger.info("Whisper model loaded successfully")
 
     interrupt = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -52,6 +60,7 @@ async def main() -> None:
                 probe_video,
                 normalize_video,
                 extract_audio,
+                index_audio_windows,
                 transcribe_audio,
                 generate_thumbnail,
                 detect_scenes,

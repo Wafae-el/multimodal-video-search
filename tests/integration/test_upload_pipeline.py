@@ -23,7 +23,14 @@ def test_full_pipeline_reaches_done_with_verified_artifacts(
     assert final["progress"] == 100
 
     steps = {s["step_name"]: s for s in final["steps"]}
-    assert set(steps) == {"probe", "normalize", "extract_audio", "thumbnail"}
+    assert set(steps) == {
+        "probe",
+        "normalize",
+        "extract_audio",
+        "audio_window_indexing",
+        "thumbnail",
+        "scene_detection",
+        }
     assert all(s["state"] == "COMPLETED" for s in steps.values())
 
     # media_files: original + proxy + audio + thumbnail

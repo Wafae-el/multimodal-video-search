@@ -1,12 +1,7 @@
 from packages.audio.windowing import AudioWindowGenerator
 
 
-def main():
-
-    print("=" * 70)
-    print("WEEK 5 - AUDIO WINDOWING")
-    print("=" * 70)
-
+def test_audio_windowing():
     generator = AudioWindowGenerator(
         window_ms=5000,
         overlap_ms=2500,
@@ -15,15 +10,6 @@ def main():
     windows = generator.generate(
         duration_ms=15000
     )
-
-    print("WINDOW COUNT =", len(windows))
-
-    for window in windows:
-        print(
-            f"WINDOW {window.index}: "
-            f"{window.start_ms} -> {window.end_ms} "
-            f"duration={window.duration_ms}"
-        )
 
     assert len(windows) == 5
 
@@ -41,16 +27,3 @@ def main():
 
     assert windows[4].start_ms == 10000
     assert windows[4].end_ms == 15000
-
-    print("PASS: 5-second windows")
-    print("PASS: 2.5-second overlap")
-    print("PASS: Correct hop size")
-
-    print()
-    print("=" * 70)
-    print("AUDIO WINDOWING = PASS")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()

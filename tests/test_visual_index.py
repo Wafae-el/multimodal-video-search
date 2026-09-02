@@ -101,5 +101,9 @@ def main():
     print("=" * 70)
 
 
+def test_visual_index():
+    main()
+
+
 if __name__ == "__main__":
     main()

@@ -320,5 +320,9 @@ def main():
     print("=" * 70)
 
 
+def test_visual_5x20():
+    main()
+
+
 if __name__ == "__main__":
     main()

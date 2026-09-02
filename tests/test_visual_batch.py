@@ -9,7 +9,7 @@ def main():
     print("=" * 70)
 
     frames = [
-        Path("/tmp/test_frame.jpg"),
+        Path(__file__).parent / "fixtures" / "test_frame.jpg",
     ]
 
     print("FRAMES =", len(frames))
@@ -42,6 +42,10 @@ def main():
     print("=" * 70)
     print("VISUAL BATCH EMBEDDING = PASS")
     print("=" * 70)
+
+
+def test_visual_batch():
+    main()
 
 
 if __name__ == "__main__":

@@ -9,26 +9,17 @@ from packages.workflow.contracts import (
     ACTIVITY_MAX_ATTEMPTS,
 )
 
-from packages.workflow.activities import (
-    probe_video,
-    normalize_video,
-    extract_audio,
-    index_audio_windows,
-    transcribe_audio,
-    generate_thumbnail,
-    detect_scenes,
-    generate_scene_frames,
-    index_visual_frames,
-)
 with workflow.unsafe.imports_passed_through():
     from packages.workflow.activities import (
         probe_video,
         normalize_video,
         extract_audio,
+        index_audio_windows,
         transcribe_audio,
         generate_thumbnail,
         detect_scenes,
         generate_scene_frames,
+        index_visual_frames,
     )
 
 # Explicit retry policy: bounded attempts, exponential backoff, and media

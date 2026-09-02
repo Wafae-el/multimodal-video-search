@@ -30,3 +30,6 @@ faster-whisper
 
 sentence-transformers
 rank-bm25
+librosa
+soundfile
+open_clip_torch
